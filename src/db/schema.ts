@@ -63,22 +63,26 @@ export const userSessions = pgTable("user_sessions", {
   createdAt: ts("created_at").notNull().defaultNow(),
 });
 
-export const agents = pgTable("agents", {
-  id: text("id").primaryKey(),
-  workspaceId: text("workspace_id").notNull(),
-  name: text("name").notNull().unique(),
-  displayName: text("display_name").notNull(),
-  type: text("type").notNull().default("custom"),
-  description: text("description").notNull().default(""),
-  capabilitiesJson: jsonb("capabilities_json").$type<string[]>().notNull().default([]),
-  color: text("color").notNull().default("#6366f1"),
-  state: text("state").notNull().default("active"), // active | paused | disabled
-  waitMode: text("wait_mode").notNull().default("infinite"), // infinite | bounded
-  lastSeenAt: ts("last_seen_at"),
-  statusState: text("status_state").notNull().default("waiting"),
-  statusActivity: text("status_activity").notNull().default(""),
-  createdAt: ts("created_at").notNull().defaultNow(),
-});
+export const agents = pgTable(
+  "agents",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id").notNull(),
+    name: text("name").notNull(), // unique per workspace, not globally
+    displayName: text("display_name").notNull(),
+    type: text("type").notNull().default("custom"),
+    description: text("description").notNull().default(""),
+    capabilitiesJson: jsonb("capabilities_json").$type<string[]>().notNull().default([]),
+    color: text("color").notNull().default("#6366f1"),
+    state: text("state").notNull().default("active"), // active | paused | disabled
+    waitMode: text("wait_mode").notNull().default("infinite"), // infinite | bounded
+    lastSeenAt: ts("last_seen_at"),
+    statusState: text("status_state").notNull().default("waiting"),
+    statusActivity: text("status_activity").notNull().default(""),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("agents_workspace_name_uq").on(t.workspaceId, t.name)],
+);
 
 export const agentTokens = pgTable("agent_tokens", {
   id: text("id").primaryKey(),
@@ -258,20 +262,30 @@ export const toolActivity = pgTable(
   (t) => [index("tool_activity_agent_idx").on(t.agentId, t.createdAt)],
 );
 
-export const auditLogs = pgTable("audit_logs", {
-  id: serial("id").primaryKey(),
-  actorKind: text("actor_kind").notNull(),
-  actorId: text("actor_id").notNull(),
-  action: text("action").notNull(),
-  target: text("target").notNull().default(""),
-  detailJson: jsonb("detail_json").$type<Record<string, unknown>>().notNull().default({}),
-  createdAt: ts("created_at").notNull().defaultNow(),
-});
+export const auditLogs = pgTable(
+  "audit_logs",
+  {
+    id: serial("id").primaryKey(),
+    workspaceId: text("workspace_id"), // null = rows written before per-user workspaces existed (ws_default)
+    actorKind: text("actor_kind").notNull(),
+    actorId: text("actor_id").notNull(),
+    action: text("action").notNull(),
+    target: text("target").notNull().default(""),
+    detailJson: jsonb("detail_json").$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [index("audit_logs_workspace_idx").on(t.workspaceId, t.id)],
+);
 
-// Durable event log for SSE (Last-Event-ID resume).
-export const events = pgTable("events", {
-  id: serial("id").primaryKey(),
-  type: text("type").notNull(),
-  payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
-  createdAt: ts("created_at").notNull().defaultNow(),
-});
+// Durable event log for SSE (Last-Event-ID resume). Scoped by workspace so a stream only replays its own tenant.
+export const events = pgTable(
+  "events",
+  {
+    id: serial("id").primaryKey(),
+    workspaceId: text("workspace_id"), // null = legacy rows from the single-workspace era (ws_default)
+    type: text("type").notNull(),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [index("events_workspace_idx").on(t.workspaceId, t.id)],
+);

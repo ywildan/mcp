@@ -39,11 +39,15 @@ export const shared: Shared = (g.__agentRelay ??= {
   lastPrune: 0,
 });
 
-/** Persist + broadcast a dashboard event (SSE source of truth, supports Last-Event-ID). */
-export async function publish(type: string, payload: Record<string, unknown>) {
+/**
+ * Persist + broadcast a dashboard event (SSE source of truth, supports Last-Event-ID).
+ * Events carry the owning workspace so a dashboard stream only ever sees its own tenant.
+ */
+export async function publish(type: string, payload: Record<string, unknown>, workspaceId?: string) {
   try {
-    const [row] = await db.insert(events).values({ type, payload }).returning();
-    shared.bus.emit("event", { id: row.id, type, payload });
+    const wsId = workspaceId ?? null;
+    const [row] = await db.insert(events).values({ type, payload, workspaceId: wsId }).returning();
+    shared.bus.emit("event", { id: row.id, type, payload, workspaceId: wsId });
     if (Date.now() - shared.lastPrune > 10 * 60_000) {
       shared.lastPrune = Date.now();
       await db.delete(events).where(lt(events.createdAt, sql`now() - interval '1 day'`));

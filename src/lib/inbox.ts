@@ -5,7 +5,7 @@ import { config, RelayError } from "./config";
 import { getSettings, hydrate, resolveParticipant, touchAgent, type AgentRow } from "./core";
 import { hookShutdown, publish, shared, type Waiter } from "./events";
 
-const presenceChanged = (agentId: string) => void publish("presence.updated", { agent_id: agentId, waiting: shared.waiters.has(agentId) });
+const presenceChanged = (agentId: string, workspaceId?: string) => void publish("presence.updated", { agent_id: agentId, waiting: shared.waiters.has(agentId) }, workspaceId);
 
 export interface ClaimOpts {
   max: number;
@@ -18,20 +18,20 @@ export interface ClaimOpts {
 const list = (xs: string[]) => sql.join(xs.map((x) => sql`${x}`), sql`, `);
 
 /** Atomically lease up to `max` inbox items (FOR UPDATE SKIP LOCKED) — at-least-once with lease. */
-export async function claimInbox(agentId: string, o: ClaimOpts) {
-  const st = await getSettings();
+export async function claimInbox(agentId: string, o: ClaimOpts, workspaceId: string) {
+  const st = await getSettings(workspaceId);
   // dead-letter: more than 5 redeliveries without ack
   const dead = await db.execute(
     sql`UPDATE inbox_items SET state='dead' WHERE agent_id=${agentId} AND state='delivered' AND lease_expires_at < now() AND delivery_count >= 6 RETURNING id`,
   );
-  if (dead.rows.length) await publish("inbox.dead", { agent_id: agentId, count: dead.rows.length });
+  if (dead.rows.length) await publish("inbox.dead", { agent_id: agentId, count: dead.rows.length }, workspaceId);
 
   const filters = [sql`true`];
   if (o.roomIds?.length) filters.push(sql`m.room_id IN (${list(o.roomIds)})`);
   if (o.types?.length) filters.push(sql`m.type IN (${list(o.types)})`);
   if (o.from?.length) {
     const ids: string[] = [];
-    for (const n of o.from) ids.push((await resolveParticipant(n).catch(() => ({ id: "none" }))).id);
+    for (const n of o.from) ids.push((await resolveParticipant(n, workspaceId).catch(() => ({ id: "none" }))).id);
     filters.push(sql`m.sender_id IN (${list(ids)})`);
   }
   const res = await db.execute(sql`
@@ -123,7 +123,7 @@ export async function waitForMessages(agent: AgentRow, o: WaitOpts): Promise<Wai
   };
   if (prev) prev.interrupt("replaced");
   shared.waiters.set(agent.id, w);
-  if (!prev) presenceChanged(agent.id);
+  if (!prev) presenceChanged(agent.id, agent.workspaceId);
   const onAbort = () => sleepDone?.();
   o.signal.addEventListener("abort", onAbort);
 
@@ -159,7 +159,7 @@ export async function waitForMessages(agent: AgentRow, o: WaitOpts): Promise<Wai
       if (cur.state === "paused")
         return { status: "paused", messages: [], next_action: "Agent paused by operator. Wait 30 seconds then call wait_for_message again, or stop if the operator tells you to." };
 
-      const rows = await claimInbox(agent.id, o);
+      const rows = await claimInbox(agent.id, o, agent.workspaceId);
       if (rows.length) {
         if (w.interrupted || o.signal.aborted) {
           await releaseItems(rows.map((r) => r.id));
@@ -191,7 +191,7 @@ export async function waitForMessages(agent: AgentRow, o: WaitOpts): Promise<Wai
     o.signal.removeEventListener("abort", onAbort);
     if (shared.waiters.get(agent.id) === w) {
       shared.waiters.delete(agent.id);
-      presenceChanged(agent.id);
+      presenceChanged(agent.id, agent.workspaceId);
     }
     await touchAgent(agent.id, true).catch(() => {});
   }

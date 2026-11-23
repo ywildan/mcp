@@ -39,7 +39,10 @@ add("GET", "auth/me", "public", async ({ req }) => {
   await core.ensureWorkspace();
   const su = await getSessionUser(req);
   const [{ n }] = await db.select({ n: count() }).from(users);
-  return su ? { user: userView(su.user), csrf: su.csrf, needs_setup: false } : { user: null, needs_setup: n === 0 };
+  if (!su) return { user: null, needs_setup: n === 0 };
+  // The signed-in user's own workspace (one workspace per account, no switcher).
+  const ws = await core.getWorkspace(su.workspaceId).catch(() => null);
+  return { user: userView(su.user), csrf: su.csrf, needs_setup: false, workspace: ws ? { id: ws.id, name: ws.name } : null };
 });
 const credSchema = z.object({ email: z.string().email().max(200), password: z.string().min(1).max(200) });
 add("POST", "auth/setup", "public", async ({ req, body }) => {
@@ -48,7 +51,11 @@ add("POST", "auth/setup", "public", async ({ req, body }) => {
   if (n > 0) throw new RelayError("forbidden", "Setup already completed", { status: 403 });
   const b = parse(credSchema.extend({ name: z.string().max(100).optional(), password: z.string().min(8).max(200) }), body);
   // The one-time setup form is only reachable while there are no users; its email counts as verified.
-  const u = await core.createUser({ kind: "user", id: "system", name: "setup" }, { email: b.email, name: b.name ?? b.email.split("@")[0], password: b.password, role: "admin", emailVerifiedAt: new Date() });
+  // Unchanged behaviour: it seeds the default workspace (ws_default + room_general) with the first admin.
+  const u = await core.createUser(
+    { kind: "user", id: "system", name: "setup" },
+    { email: b.email, name: b.name ?? b.email.split("@")[0], password: b.password, role: "admin", emailVerifiedAt: new Date(), workspaceId: core.WS_ID },
+  );
   const sess = await createSession(u.id);
   return { __cookie: sessionCookie(req, sess.raw), user: u, csrf: sess.csrf };
 });
@@ -94,15 +101,16 @@ add("POST", "auth/signup/verify", "public", async ({ req, body }) => {
     u = updated;
     await core.audit({ kind: "user", id: u.id }, "signup.verified", u.email);
   } else {
+    // Brand-new account → brand-new workspace owned by this user (admin of it, member of its general room).
     const created = await core.createUser({ kind: "user", id: "signup", name: "signup" }, {
       email: pending.email,
       name: pending.name,
       passwordHash: pending.passwordHash,
-      role: "member",
+      role: "admin",
       emailVerifiedAt: new Date(),
     });
     [u] = await db.select().from(users).where(eq(users.id, created.id));
-    await core.audit({ kind: "user", id: u.id }, "signup.created", u.email);
+    await core.audit({ kind: "user", id: u.id }, "signup.created", u.email, {}, u.workspaceId);
   }
   const sess = await createSession(u.id);
   return { __cookie: sessionCookie(req, sess.raw), needs_setup: false, user: userView(u), csrf: sess.csrf };
@@ -119,81 +127,82 @@ add("POST", "auth/logout", "user", async ({ req, su }) => {
 });
 
 // ── agents ──
-add("GET", "agents", "user", async () => ({ agents: await core.listAgentViews() }));
+add("GET", "agents", "user", async ({ su }) => ({ agents: await core.listAgentViews(false, su.workspaceId) }));
 add("POST", "agents", "admin", async ({ body, su }) => {
   const b = parse(
     z.object({ name: z.string().max(40), display_name: z.string().max(80).optional(), type: z.string().optional(), description: z.string().max(500).optional(), capabilities: z.array(z.string()).optional(), color: z.string().max(20).optional(), wait_mode: z.string().optional() }),
     body,
   );
-  return core.createAgent(su.actor, { name: b.name, displayName: b.display_name, type: b.type, description: b.description, capabilities: b.capabilities, color: b.color, waitMode: b.wait_mode });
+  return core.createAgent(su.actor, { name: b.name, displayName: b.display_name, type: b.type, description: b.description, capabilities: b.capabilities, color: b.color, waitMode: b.wait_mode }, su.workspaceId);
 });
-add("GET", "agents/:id", "user", async ({ p }) => ({ agent: await core.getAgentView(p.id) }));
+add("GET", "agents/:id", "user", async ({ p, su }) => ({ agent: await core.getAgentView(p.id, su.workspaceId) }));
 add("PATCH", "agents/:id", "admin", async ({ p, body, su }) => {
   const b = parse(z.object({ display_name: z.string().max(80).optional(), type: z.string().optional(), description: z.string().max(500).optional(), capabilities: z.array(z.string()).optional(), color: z.string().max(20).optional(), wait_mode: z.string().optional() }), body);
-  return { agent: await core.updateAgent(su.actor, p.id, { displayName: b.display_name, type: b.type, description: b.description, capabilities: b.capabilities, color: b.color, waitMode: b.wait_mode }) };
+  return { agent: await core.updateAgent(su.actor, p.id, { displayName: b.display_name, type: b.type, description: b.description, capabilities: b.capabilities, color: b.color, waitMode: b.wait_mode }, su.workspaceId) };
 });
 add("DELETE", "agents/:id", "admin", async ({ p, su }) => {
-  await core.deleteAgent(su.actor, p.id);
+  await core.deleteAgent(su.actor, p.id, su.workspaceId);
   return ok;
 });
 add("POST", "agents/:id/tokens", "admin", async ({ p, body, su }) => {
   // rotate=true revokes all active tokens first; otherwise just adds a new token.
   const b = parse(z.object({ rotate: z.boolean().optional() }), body);
-  const t = b.rotate ? await core.rotateToken(su.actor, p.id) : await core.addToken(su.actor, p.id);
+  const t = b.rotate ? await core.rotateToken(su.actor, p.id, undefined, su.workspaceId) : await core.addToken(su.actor, p.id, su.workspaceId);
   return { token: t.token, token_id: t.id, prefix: t.prefix };
 });
 add("DELETE", "agents/:id/tokens/:tid", "admin", async ({ p, su }) => {
-  await core.revokeToken(su.actor, p.id, p.tid);
+  await core.revokeToken(su.actor, p.id, p.tid, su.workspaceId);
   return ok;
 });
-add("POST", "agents/:id/pause", "admin", async ({ p, su }) => ({ agent: await core.setAgentState(su.actor, p.id, "paused") }));
-add("POST", "agents/:id/resume", "admin", async ({ p, su }) => ({ agent: await core.setAgentState(su.actor, p.id, "active") }));
+add("POST", "agents/:id/pause", "admin", async ({ p, su }) => ({ agent: await core.setAgentState(su.actor, p.id, "paused", su.workspaceId) }));
+add("POST", "agents/:id/resume", "admin", async ({ p, su }) => ({ agent: await core.setAgentState(su.actor, p.id, "active", su.workspaceId) }));
 add("POST", "agents/:id/wake", "user", async ({ p, su }) => {
+  await core.requireWorkspaceAgent(su.workspaceId, p.id);
   const woke = interruptWaiter(p.id, "wake");
-  await core.audit(su.actor, "agent.wake", p.id, { had_wait: woke });
+  await core.audit(su.actor, "agent.wake", p.id, { had_wait: woke }, su.workspaceId);
   return { interrupted: woke };
 });
 
 // ── rooms ──
-add("GET", "rooms", "user", async ({ su }) => ({ rooms: await core.listRoomsFor(su.actor, "all") }));
+add("GET", "rooms", "user", async ({ su }) => ({ rooms: await core.listRoomsFor(su.actor, "all", su.workspaceId) }));
 add("POST", "rooms", "user", async ({ body, su }) => {
   const b = parse(z.object({ name: z.string(), topic: z.string().max(500).optional(), pinned_instructions: z.string().max(8000).optional(), members: z.array(z.string()).optional(), visibility: z.string().optional(), hop_limit: z.number().int().optional() }), body);
-  return { room: await core.createRoom(su.actor, { name: b.name, topic: b.topic, pinnedInstructions: b.pinned_instructions, members: b.members, visibility: b.visibility, hopLimit: b.hop_limit }) };
+  return { room: await core.createRoom(su.actor, { name: b.name, topic: b.topic, pinnedInstructions: b.pinned_instructions, members: b.members, visibility: b.visibility, hopLimit: b.hop_limit }, su.workspaceId) };
 });
-add("GET", "rooms/:id", "user", async ({ p }) => ({ room: core.toRoomView(await core.getRoom(p.id)), members: await core.getMembers(p.id) }));
+add("GET", "rooms/:id", "user", async ({ p, su }) => ({ room: core.toRoomView(await core.getRoom(p.id, db, su.workspaceId)), members: await core.getMembers(p.id, su.workspaceId) }));
 add("PATCH", "rooms/:id", "user", async ({ p, body, su }) => {
   const b = parse(z.object({ topic: z.string().max(500).optional(), pinned_instructions: z.string().max(8000).optional(), hop_limit: z.number().int().optional(), humans_wake_all: z.boolean().nullable().optional(), state: z.string().optional(), visibility: z.string().optional(), name: z.string().optional() }), body);
-  return { room: await core.updateRoom(su.actor, p.id, { topic: b.topic, pinnedInstructions: b.pinned_instructions, hopLimit: b.hop_limit, humansWakeAll: b.humans_wake_all, state: b.state, visibility: b.visibility, name: b.name }) };
+  return { room: await core.updateRoom(su.actor, p.id, { topic: b.topic, pinnedInstructions: b.pinned_instructions, hopLimit: b.hop_limit, humansWakeAll: b.humans_wake_all, state: b.state, visibility: b.visibility, name: b.name }, su.workspaceId) };
 });
 add("POST", "rooms/:id/members", "user", async ({ p, body, su }) => {
   const b = parse(z.object({ name: z.string().optional(), participant_id: z.string().optional(), notify_mode: z.enum(["all", "mentions_only", "none"]).optional() }), body);
-  const t = b.participant_id ? pid(b.participant_id) : b.name ? await core.resolveParticipant(b.name) : null;
+  const t = b.participant_id ? pid(b.participant_id) : b.name ? await core.resolveParticipant(b.name, su.workspaceId) : null;
   if (!t) throw new RelayError("invalid_input", "name or participant_id required");
-  await core.addMember(su.actor, p.id, t.kind, t.id, b.notify_mode);
-  return { members: await core.getMembers(p.id) };
+  await core.addMember(su.actor, p.id, t.kind, t.id, b.notify_mode, su.workspaceId);
+  return { members: await core.getMembers(p.id, su.workspaceId) };
 });
-add("PATCH", "rooms/:id/members/:pid", "user", async ({ p, body }) => {
+add("PATCH", "rooms/:id/members/:pid", "user", async ({ p, body, su }) => {
   const t = pid(p.pid);
   const b = parse(z.object({ notify_mode: z.enum(["all", "mentions_only", "none"]) }), body);
-  await core.setNotifyMode(p.id, t.kind, t.id, b.notify_mode);
-  return { members: await core.getMembers(p.id) };
+  await core.setNotifyMode(p.id, t.kind, t.id, b.notify_mode, su.workspaceId);
+  return { members: await core.getMembers(p.id, su.workspaceId) };
 });
 add("DELETE", "rooms/:id/members/:pid", "user", async ({ p, su }) => {
   const t = pid(p.pid);
-  await core.removeMember(su.actor, p.id, t.kind, t.id);
-  return { members: await core.getMembers(p.id) };
+  await core.removeMember(su.actor, p.id, t.kind, t.id, su.workspaceId);
+  return { members: await core.getMembers(p.id, su.workspaceId) };
 });
-add("POST", "rooms/:id/pause", "user", async ({ p, su }) => ({ room: await core.setRoomState(su.actor, p.id, "paused") }));
-add("POST", "rooms/:id/resume", "user", async ({ p, su }) => ({ room: await core.setRoomState(su.actor, p.id, "active") }));
-add("GET", "rooms/:id/messages", "user", async ({ p, url }) => {
+add("POST", "rooms/:id/pause", "user", async ({ p, su }) => ({ room: await core.setRoomState(su.actor, p.id, "paused", "operator", su.workspaceId) }));
+add("POST", "rooms/:id/resume", "user", async ({ p, su }) => ({ room: await core.setRoomState(su.actor, p.id, "active", "operator", su.workspaceId) }));
+add("GET", "rooms/:id/messages", "user", async ({ p, url, su }) => {
   const q = url.searchParams;
-  return core.readMessages(p.id, { beforeSeq: Number(q.get("before_seq")) || undefined, afterSeq: Number(q.get("after_seq")) || undefined, limit: Number(q.get("limit")) || 50, threadId: q.get("thread_id") ?? undefined });
+  return core.readMessages(p.id, { beforeSeq: Number(q.get("before_seq")) || undefined, afterSeq: Number(q.get("after_seq")) || undefined, limit: Number(q.get("limit")) || 50, threadId: q.get("thread_id") ?? undefined }, su.workspaceId);
 });
 add("POST", "rooms/:id/messages", "user", async ({ p, body, su }) => {
   const b = parse(z.object({ content: z.string(), reply_to: z.string().optional(), thread_id: z.string().optional(), attachments: z.array(z.string()).optional(), client_message_id: z.string().max(128).optional(), metadata: z.record(z.string(), z.unknown()).optional() }), body);
-  return core.sendMessage(su.actor, { roomId: p.id, content: b.content, replyTo: b.reply_to, threadId: b.thread_id, attachments: b.attachments, clientMessageId: b.client_message_id, metadata: b.metadata });
+  return core.sendMessage(su.actor, { roomId: p.id, content: b.content, replyTo: b.reply_to, threadId: b.thread_id, attachments: b.attachments, clientMessageId: b.client_message_id, metadata: b.metadata }, su.workspaceId);
 });
-add("GET", "rooms/:id/artifacts", "user", async ({ p }) => ({ artifacts: await core.listArtifacts(p.id) }));
+add("GET", "rooms/:id/artifacts", "user", async ({ p, su }) => ({ artifacts: await core.listArtifacts(p.id, su.workspaceId) }));
 
 // ── messages ──
 add("PATCH", "messages/:id", "admin", async ({ p, body, su }) => ({ message: await core.editMessage(su.actor, p.id, parse(z.object({ content: z.string() }), body).content) }));
@@ -204,7 +213,7 @@ add("DELETE", "messages/:id", "admin", async ({ p, su }) => {
 add("GET", "search", "user", async ({ url, su }) => ({ messages: await core.searchMessages(su.actor, url.searchParams.get("q") ?? "", { roomId: url.searchParams.get("room_id") ?? undefined }) }));
 
 // ── tasks ──
-add("GET", "tasks", "user", async ({ url }) => ({ tasks: await core.listTasks({ assignee: url.searchParams.get("assignee") ?? undefined, status: url.searchParams.get("status") ?? undefined, roomId: url.searchParams.get("room_id") ?? undefined }) }));
+add("GET", "tasks", "user", async ({ url, su }) => ({ tasks: await core.listTasks({ assignee: url.searchParams.get("assignee") ?? undefined, status: url.searchParams.get("status") ?? undefined, roomId: url.searchParams.get("room_id") ?? undefined }, su.workspaceId) }));
 add("POST", "tasks", "user", async ({ body, su }) => {
   const b = parse(z.object({ title: z.string(), description: z.string().optional(), assignee: z.string(), room_id: z.string().optional(), priority: z.string().optional(), acceptance_criteria: z.string().optional(), due: z.string().optional() }), body);
   return { task: await core.createTask(su.actor, { title: b.title, description: b.description, assignee: b.assignee, roomId: b.room_id, priority: b.priority, acceptanceCriteria: b.acceptance_criteria, due: b.due }) };
@@ -243,16 +252,16 @@ add("GET", "artifacts/:id/download", "public", async ({ req, p, url }) => {
 });
 
 // ── human requests ──
-add("GET", "human-requests", "user", async ({ url }) => ({ requests: await core.listHumanRequests(url.searchParams.get("status") ?? undefined) }));
+add("GET", "human-requests", "user", async ({ url, su }) => ({ requests: await core.listHumanRequests(url.searchParams.get("status") ?? undefined, su.workspaceId) }));
 add("POST", "human-requests/:id/answer", "user", async ({ p, body, su }) => {
   await core.answerHumanRequest(su.actor, p.id, parse(z.object({ answer: z.string().min(1).max(8000) }), body).answer);
   return ok;
 });
 
 // ── observability / admin ──
-add("GET", "audit-logs", "admin", async ({ url }) => ({ logs: await core.listAudit(Number(url.searchParams.get("limit")) || 200) }));
-add("GET", "activity", "user", async ({ url }) => ({ activity: await core.listActivity(url.searchParams.get("agent_id") ?? undefined, Number(url.searchParams.get("limit")) || 100) }));
-add("GET", "inbox/dead", "user", async () => ({ items: await core.listDeadLetters() }));
+add("GET", "audit-logs", "admin", async ({ url, su }) => ({ logs: await core.listAudit(Number(url.searchParams.get("limit")) || 200, su.workspaceId) }));
+add("GET", "activity", "user", async ({ url, su }) => ({ activity: await core.listActivity(url.searchParams.get("agent_id") ?? undefined, Number(url.searchParams.get("limit")) || 100, su.workspaceId) }));
+add("GET", "inbox/dead", "user", async ({ su }) => ({ items: await core.listDeadLetters(su.workspaceId) }));
 add("POST", "inbox/:id/requeue", "admin", async ({ p, su }) => {
   await core.requeueDead(su.actor, p.id);
   return ok;
@@ -261,12 +270,13 @@ add("POST", "inbox/:id/discard", "admin", async ({ p, su }) => {
   await core.discardDead(su.actor, p.id);
   return ok;
 });
-add("GET", "settings", "user", async () => ({ settings: await core.getSettings() }));
+add("GET", "settings", "user", async ({ su }) => ({ settings: await core.getSettings(su.workspaceId) }));
 add("PATCH", "settings", "admin", async ({ body, su }) => ({ settings: await core.updateSettings(su.actor, (body ?? {}) as Partial<core.Settings>) }));
-add("GET", "users", "admin", async () => ({ users: (await db.select().from(users)).map(userView) }));
+add("GET", "users", "admin", async ({ su }) => ({ users: (await db.select().from(users).where(eq(users.workspaceId, su.workspaceId))).map(userView) }));
 add("POST", "users", "admin", async ({ body, su }) => {
   const b = parse(z.object({ email: z.string().email(), name: z.string().max(100).optional(), password: z.string().min(8).max(200), role: z.enum(["admin", "member"]).optional() }), body);
-  return { user: await core.createUser(su.actor, { email: b.email, name: b.name ?? b.email.split("@")[0], password: b.password, role: b.role ?? "member" }) };
+  // Admins can only add users to their own workspace.
+  return { user: await core.createUser(su.actor, { email: b.email, name: b.name ?? b.email.split("@")[0], password: b.password, role: b.role ?? "member", workspaceId: su.workspaceId }) };
 });
 
 function match(method: string, segs: string[]) {

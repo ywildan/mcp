@@ -36,6 +36,8 @@ export function buildMcpServer(ctx: McpCtx) {
   const server = new McpServer({ name: "agentrelay", version: "1.0.0" }, { instructions: INSTRUCTIONS });
   const agent = ctx.agent;
   const actor: core.Actor = { kind: "agent", id: agent.id, name: agent.name };
+  // Agent tokens are bound to their workspace: every tool below reads/writes only this workspace.
+  const wsId = agent.workspaceId;
 
   const def = (name: string, description: string, shape: z.ZodRawShape, fn: (a: any, extra: any) => Promise<Record<string, unknown>>) => {
     server.registerTool(
@@ -44,7 +46,7 @@ export function buildMcpServer(ctx: McpCtx) {
       (async (args: any, extra: any) => {
         const t0 = Date.now();
         try {
-          const st = await core.getSettings();
+          const st = await core.getSettings(wsId);
           const rl = shared.rate.hit(`calls:${agent.id}`, st.rateCallsPerMin);
           if (rl) throw new RelayError("rate_limited", `Tool call rate limit exceeded (${st.rateCallsPerMin}/min)`, { retry_after: rl });
           if (name === "send_message" || name === "create_task") {
@@ -53,45 +55,46 @@ export function buildMcpServer(ctx: McpCtx) {
           }
           await core.touchAgent(agent.id);
           const out = await fn(args, extra);
-          void core.logActivity(agent.id, name, "ok", Date.now() - t0, undefined, summarize(name, args));
+          void core.logActivity(agent.id, name, "ok", Date.now() - t0, undefined, summarize(name, args), wsId);
           return { content: [{ type: "text", text: JSON.stringify(out) }], structuredContent: out };
         } catch (e) {
           const body = errorBody(e);
-          void core.logActivity(agent.id, name, "error", Date.now() - t0, body.error.code, body.error.message.slice(0, 200));
+          void core.logActivity(agent.id, name, "error", Date.now() - t0, body.error.code, body.error.message.slice(0, 200), wsId);
           return { isError: true, content: [{ type: "text", text: JSON.stringify(body) }], structuredContent: body };
         }
       }) as any,
     );
   };
 
-  const inRoom = async (roomId: string) => core.assertMember(roomId, actor);
+  const inRoom = async (roomId: string) => core.assertMember(roomId, actor, wsId);
 
   def("whoami", "Your identity, rooms and pending inbox count.", {}, async () => {
-    const rooms = await core.listRoomsFor(actor, "mine");
+    const rooms = await core.listRoomsFor(actor, "mine", wsId);
     const inbox = await checkInbox(agent.id);
     return { agent: core.toAgentView(agent), rooms: rooms.map((r) => ({ id: r.id, name: r.name, kind: r.kind, state: r.state, members: r.members })), inbox_pending: inbox.pending_count };
   });
 
-  def("list_agents", "List agents/humans with presence and status.", { include_offline: z.boolean().optional() }, async (a) => core.listParticipants(a.include_offline !== false));
+  def("list_agents", "List agents/humans with presence and status.", { include_offline: z.boolean().optional() }, async (a) => core.listParticipants(a.include_offline !== false, wsId));
 
   def("list_rooms", "Rooms you are in (scope=mine) or open rooms you can join (scope=open).", { scope: z.enum(["mine", "open"]).optional() }, async (a) => ({
-    rooms: await core.listRoomsFor(actor, a.scope ?? "mine"),
+    rooms: await core.listRoomsFor(actor, a.scope ?? "mine", wsId),
   }));
 
   def(
     "create_room",
     "Create a group room.",
     { name: z.string(), topic: z.string().optional(), members: z.array(z.string()).optional(), visibility: z.enum(["open", "private"]).optional() },
-    async (a) => ({ room: await core.createRoom(actor, { name: a.name, topic: a.topic, members: a.members, visibility: a.visibility }) }),
+    async (a) => ({ room: await core.createRoom(actor, { name: a.name, topic: a.topic, members: a.members, visibility: a.visibility }, wsId) }),
   );
   def("join_room", "Join an open room. Returns room context.", { room_id: z.string() }, async (a) => {
     await core.joinRoom(agent, a.room_id);
-    return { room: (await core.getRoomContext(a.room_id)).room, context: await core.getRoomContext(a.room_id) };
+    const context = await core.getRoomContext(a.room_id, wsId);
+    return { room: context.room, context };
   });
   def("leave_room", "Leave a room.", { room_id: z.string() }, async (a) => ({ room: await core.leaveRoom(agent, a.room_id) }));
   def("get_room_context", "Topic, pinned instructions and members of a room.", { room_id: z.string() }, async (a) => {
     await inRoom(a.room_id);
-    return { context: await core.getRoomContext(a.room_id) };
+    return { context: await core.getRoomContext(a.room_id, wsId) };
   });
 
   def(
@@ -119,7 +122,7 @@ export function buildMcpServer(ctx: McpCtx) {
         attachments: a.attachments,
         metadata: a.metadata,
         clientMessageId: a.client_message_id,
-      }),
+      }, wsId),
   );
 
   def(
@@ -135,7 +138,7 @@ export function buildMcpServer(ctx: McpCtx) {
       _chunk: z.boolean().optional().describe("internal: used by the stdio shim"),
     },
     async (a, extra) => {
-      const st = await core.getSettings();
+      const st = await core.getSettings(wsId);
       let t: number = a.timeout_seconds ?? st.waitDefaultSeconds;
       if (agent.waitMode === "bounded" && !t) t = st.waitDefaultSeconds || 25;
       if (a._chunk) t = Math.min(t || config.waitChunkSeconds, config.waitChunkSeconds);
@@ -169,7 +172,7 @@ export function buildMcpServer(ctx: McpCtx) {
     { room_id: z.string(), before_seq: z.number().int().optional(), after_seq: z.number().int().optional(), limit: z.number().int().min(1).max(200).optional(), thread_id: z.string().optional() },
     async (a) => {
       await inRoom(a.room_id);
-      return core.readMessages(a.room_id, { beforeSeq: a.before_seq, afterSeq: a.after_seq, limit: a.limit ?? 50, threadId: a.thread_id });
+      return core.readMessages(a.room_id, { beforeSeq: a.before_seq, afterSeq: a.after_seq, limit: a.limit ?? 50, threadId: a.thread_id }, wsId);
     },
   );
   def(
@@ -186,7 +189,7 @@ export function buildMcpServer(ctx: McpCtx) {
     "Update your activity status shown on the dashboard.",
     { state: z.enum(["waiting", "working", "blocked", "error"]), activity: z.string().max(200).optional() },
     async (a) => {
-      await core.setStatus(agent.id, a.state, a.activity ?? "");
+      await core.setStatus(agent.id, a.state, a.activity ?? "", wsId);
       return { ok: true };
     },
   );
@@ -218,7 +221,7 @@ export function buildMcpServer(ctx: McpCtx) {
     "list_tasks",
     "List tasks in rooms you belong to.",
     { assignee: z.string().optional(), status: z.string().optional(), room_id: z.string().optional() },
-    async (a) => ({ tasks: await core.listTasks({ assignee: a.assignee, status: a.status, roomId: a.room_id, actor }) }),
+    async (a) => ({ tasks: await core.listTasks({ assignee: a.assignee, status: a.status, roomId: a.room_id, actor }, wsId) }),
   );
 
   def(
@@ -253,7 +256,7 @@ export function buildMcpServer(ctx: McpCtx) {
 
   // Resources
   server.registerResource("agents", "agentrelay://agents", { description: "Agents and presence", mimeType: "application/json" }, async (uri) => ({
-    contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await core.listParticipants(true)) }],
+    contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await core.listParticipants(true, wsId)) }],
   }));
   server.registerResource(
     "room_context",
@@ -261,7 +264,7 @@ export function buildMcpServer(ctx: McpCtx) {
     { description: "Room context", mimeType: "application/json" },
     async (uri, vars) => {
       await inRoom(String(vars.id));
-      return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await core.getRoomContext(String(vars.id))) }] };
+      return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await core.getRoomContext(String(vars.id), wsId)) }] };
     },
   );
   server.registerResource("artifact", new ResourceTemplate("agentrelay://artifacts/{id}", { list: undefined }), { description: "Artifact", mimeType: "application/json" }, async (uri, vars) => ({

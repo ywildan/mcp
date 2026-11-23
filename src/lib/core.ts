@@ -40,17 +40,20 @@ const defaults = (): Settings => ({
   redactActivity: false,
   autoAddMentions: false,
 });
-let settingsCache: { at: number; v: Settings } | null = null;
-export async function getSettings(): Promise<Settings> {
-  if (settingsCache && Date.now() - settingsCache.at < 3000) return settingsCache.v;
+const settingsCache = new Map<string, { at: number; v: Settings }>();
+/** Settings are per workspace: every tenant may tune its own limits. */
+export async function getSettings(workspaceId: string = WS_ID): Promise<Settings> {
+  const hit = settingsCache.get(workspaceId);
+  if (hit && Date.now() - hit.at < 3000) return hit.v;
   await ensureWorkspace();
-  const [w] = await db.select().from(s.workspaces).where(eq(s.workspaces.id, WS_ID));
+  const [w] = await db.select().from(s.workspaces).where(eq(s.workspaces.id, workspaceId));
   const v = { ...defaults(), ...((w?.settingsJson ?? {}) as Partial<Settings>) };
-  settingsCache = { at: Date.now(), v };
+  settingsCache.set(workspaceId, { at: Date.now(), v });
   return v;
 }
 export async function updateSettings(actor: Actor, patch: Partial<Settings>) {
-  const cur = await getSettings();
+  const wsId = await actorWorkspaceId(actor);
+  const cur = await getSettings(wsId);
   const next: Settings = { ...cur };
   const numKeys = ["hopLimit", "rateMsgPerMin", "rateCallsPerMin", "waitDefaultSeconds", "leaseSeconds", "retentionDaysMessages", "retentionDaysInbox"] as const;
   for (const k of numKeys) {
@@ -64,10 +67,72 @@ export async function updateSettings(actor: Actor, patch: Partial<Settings>) {
   if (next.leaseSeconds < 1) throw new RelayError("invalid_input", "leaseSeconds must be >= 1");
   if (patch.redactActivity !== undefined) next.redactActivity = !!patch.redactActivity;
   if (patch.autoAddMentions !== undefined) next.autoAddMentions = !!patch.autoAddMentions;
-  await db.update(s.workspaces).set({ settingsJson: next as unknown as Record<string, unknown> }).where(eq(s.workspaces.id, WS_ID));
-  settingsCache = null;
+  await db.update(s.workspaces).set({ settingsJson: next as unknown as Record<string, unknown> }).where(eq(s.workspaces.id, wsId));
+  settingsCache.delete(wsId);
   await audit(actor, "settings.update", "workspace", patch as Record<string, unknown>);
   return next;
+}
+
+// ───────────────────────── workspaces ─────────────────────────
+// One workspace per account. WS_ID/GENERAL_ID are only used to bootstrap the legacy default workspace
+// (first-ever setup) — every other path resolves the workspace from the actor.
+export type WorkspaceRow = typeof s.workspaces.$inferSelect;
+
+export async function getWorkspace(workspaceId: string): Promise<WorkspaceRow> {
+  const [w] = await db.select().from(s.workspaces).where(eq(s.workspaces.id, workspaceId));
+  if (!w) throw new RelayError("not_found", "Workspace not found");
+  return w;
+}
+
+/** The workspace a logged-in user belongs to (from the user row carried on the session). */
+export async function workspaceIdForUser(userId: string): Promise<string> {
+  const [u] = await db.select({ workspaceId: s.users.workspaceId }).from(s.users).where(eq(s.users.id, userId));
+  if (!u) throw new RelayError("unauthorized", "Login required");
+  return u.workspaceId;
+}
+
+/** The workspace an actor (user session or agent token) belongs to. */
+export async function actorWorkspaceId(actor: Actor): Promise<string> {
+  if (actor.kind === "user") return workspaceIdForUser(actor.id);
+  const ws = await agentWorkspaceId(actor.id);
+  if (!ws) throw new RelayError("not_found", "Agent not found");
+  return ws;
+}
+
+export async function agentWorkspaceId(agentId: string): Promise<string | null> {
+  const [a] = await db.select({ workspaceId: s.agents.workspaceId }).from(s.agents).where(eq(s.agents.id, agentId));
+  return a?.workspaceId ?? null;
+}
+
+/** The workspace's "general" room — found by name, so generated ids in new workspaces work too. */
+export async function generalRoomId(workspaceId: string, d: DbLike = db): Promise<string> {
+  const [r] = await d.select({ id: s.rooms.id }).from(s.rooms).where(and(eq(s.rooms.workspaceId, workspaceId), eq(s.rooms.name, "general"))).limit(1);
+  if (r) return r.id;
+  if (workspaceId === WS_ID) return GENERAL_ID; // legacy default workspace
+  throw new RelayError("not_found", "No general room in this workspace");
+}
+
+/**
+ * Create a fresh workspace owned by one user: workspace row + its own general room + membership.
+ * The owner is an admin of that workspace; nothing is shared with any other workspace.
+ */
+export async function createWorkspaceForUser(
+  owner: { id: string; name: string; email: string },
+  opts: { role?: "admin" | "member"; rooms?: { id: string; name: string }[] } = {},
+) {
+  const wsId = newId("ws");
+  const name = (owner.name || owner.email.split("@")[0] || "workspace").trim().slice(0, 100) || "workspace";
+  await db.insert(s.workspaces).values({ id: wsId, name });
+  const generalId = opts.rooms?.find((r) => r.name === "general")?.id ?? newId("room");
+  await db
+    .insert(s.rooms)
+    .values({ id: generalId, workspaceId: wsId, name: "general", topic: `Workspace of ${name}`, hopLimit: config.hopLimitDefault })
+    .onConflictDoNothing();
+  await db
+    .insert(s.roomMembers)
+    .values({ roomId: generalId, participantKind: "user", participantId: owner.id, notifyMode: "all" })
+    .onConflictDoNothing();
+  return { workspaceId: wsId, generalRoomId: generalId, role: opts.role ?? "admin" };
 }
 
 // ───────────────────────── workspace bootstrap ─────────────────────────
@@ -86,7 +151,7 @@ export function ensureWorkspace(): Promise<void> {
       const [{ n }] = await db.select({ n: sql<number>`count(*)::int` }).from(s.users);
       if (n === 0) {
         // Bootstrap admin comes from trusted env config, so its email is considered verified.
-        await createUser({ kind: "user", id: "system", name: "bootstrap" }, { email, name: email.split("@")[0], password: pw, role: "admin", emailVerifiedAt: new Date() }).catch((e) =>
+        await createUser({ kind: "user", id: "system", name: "bootstrap" }, { email, name: email.split("@")[0], password: pw, role: "admin", emailVerifiedAt: new Date(), workspaceId: WS_ID }).catch((e) =>
           log("warn", "bootstrap_admin_failed", { err: String(e) }),
         );
       }
@@ -113,16 +178,32 @@ async function backfillEmailVerification() {
     .where(eq(s.workspaces.id, WS_ID));
 }
 
-export async function audit(actor: { kind: string; id: string }, action: string, target = "", detail: Record<string, unknown> = {}) {
-  await db.insert(s.auditLogs).values({ actorKind: actor.kind, actorId: actor.id, action, target, detailJson: detail });
+export async function audit(actor: { kind: string; id: string }, action: string, target = "", detail: Record<string, unknown> = {}, workspaceId?: string) {
+  await db.insert(s.auditLogs).values({ actorKind: actor.kind, actorId: actor.id, action, target, detailJson: detail, workspaceId: workspaceId ?? null });
 }
 
 // ───────────────────────── users ─────────────────────────
 export const userHandle = (u: { email: string }) => u.email.split("@")[0].toLowerCase().replace(/[^a-z0-9_-]/g, "-");
 
+/**
+ * Create an account. Without an explicit workspaceId this provisions a brand-new workspace owned by the new
+ * user (admin of their own workspace) — that is the default for public signup and for admins adding members.
+ * Passing workspaceId joins an existing workspace instead (used when an existing unverified account is
+ * confirmed, and by first-admin bootstrap which targets the legacy default workspace).
+ */
 export async function createUser(
   actor: Actor,
-  i: { email: string; name: string; password?: string; passwordHash?: string; role: "admin" | "member"; emailVerifiedAt?: Date | null },
+  i: {
+    email: string;
+    name: string;
+    password?: string;
+    passwordHash?: string;
+    role: "admin" | "member";
+    emailVerifiedAt?: Date | null;
+    workspaceId?: string;
+    workspaceName?: string;
+    skipVerification?: boolean;
+  },
 ) {
   const { hashPassword } = await import("./auth");
   // passwordHash lets the email-signup flow pass an already-hashed password (the plain one is never stored).
@@ -131,10 +212,28 @@ export async function createUser(
   const [dupe] = await db.select().from(s.users).where(eq(s.users.email, email));
   if (dupe) throw new RelayError("conflict", "Email already registered", { status: 409 });
   const id = newId("usr");
-  await db.insert(s.users).values({ id, workspaceId: WS_ID, email, name: i.name || email.split("@")[0], passwordHash: i.passwordHash ?? (await hashPassword(i.password!)), role: i.role, emailVerifiedAt: i.emailVerifiedAt ?? null });
-  await db.insert(s.roomMembers).values({ roomId: GENERAL_ID, participantKind: "user", participantId: id, notifyMode: "all" }).onConflictDoNothing();
-  await audit(actor, "user.create", id, { email, role: i.role });
-  return { id, email, name: i.name, role: i.role };
+  const name = i.name || email.split("@")[0];
+  const emailVerifiedAt = i.emailVerifiedAt ?? (i.skipVerification ? new Date() : null);
+  const passwordHash = i.passwordHash ?? (await hashPassword(i.password!));
+
+  if (i.workspaceId) {
+    // Existing workspace: add the user as a member of its general room.
+    await db.insert(s.users).values({ id, workspaceId: i.workspaceId, email, name, passwordHash, role: i.role, emailVerifiedAt });
+    const generalId = await generalRoomId(i.workspaceId);
+    await db.insert(s.roomMembers).values({ roomId: generalId, participantKind: "user", participantId: id, notifyMode: "all" }).onConflictDoNothing();
+    await audit(actor, "user.create", id, { email, role: i.role, workspace_id: i.workspaceId });
+    return { id, email, name, role: i.role, workspaceId: i.workspaceId };
+  }
+
+  // New account → brand-new workspace owned by this user.
+  const { workspaceId, generalRoomId: roomId } = await createWorkspaceForUser({ id, name: i.workspaceName?.trim() || name, email }, { role: i.role });
+  await db.insert(s.users).values({ id, workspaceId, email, name, passwordHash, role: i.role, emailVerifiedAt });
+  await db
+    .insert(s.roomMembers)
+    .values({ roomId, participantKind: "user", participantId: id, notifyMode: "all" })
+    .onConflictDoNothing();
+  await audit(actor, "user.create", id, { email, role: i.role, workspace_id: workspaceId });
+  return { id, email, name, role: i.role, workspaceId };
 }
 
 // ───────────────────────── agents & tokens ─────────────────────────
@@ -147,21 +246,29 @@ export async function issueToken(agentId: string) {
   return { id, token, prefix: token.slice(0, 16) };
 }
 
+/** Fetch an agent that must belong to `workspaceId`; a foreign id is reported as not found. */
+export async function requireWorkspaceAgent(workspaceId: string, agentId: string): Promise<AgentRow> {
+  const [a] = await db.select().from(s.agents).where(and(eq(s.agents.id, agentId), eq(s.agents.workspaceId, workspaceId)));
+  if (!a) throw new RelayError("not_found", "Agent not found");
+  return a;
+}
+
 export async function createAgent(
   actor: Actor,
   i: { name: string; displayName?: string; type?: string; description?: string; capabilities?: string[]; color?: string; waitMode?: string },
+  workspaceId: string = WS_ID,
 ) {
   await ensureWorkspace();
   const name = i.name.trim().toLowerCase();
   if (!NAME_RE.test(name) || name === "system") throw new RelayError("invalid_input", "name must be a slug: 2-32 chars of a-z, 0-9, _ or -");
   const type = i.type && AGENT_TYPES.includes(i.type) ? i.type : "custom";
-  const [dupe] = await db.select().from(s.agents).where(eq(s.agents.name, name));
+  const [dupe] = await db.select().from(s.agents).where(and(eq(s.agents.workspaceId, workspaceId), eq(s.agents.name, name)));
   if (dupe) throw new RelayError("conflict", `Agent name '${name}' already exists`, { status: 409 });
   const id = newId("agt");
   const palette = ["#6366f1", "#ec4899", "#10b981", "#f59e0b", "#06b6d4", "#8b5cf6", "#ef4444", "#84cc16"];
   await db.insert(s.agents).values({
     id,
-    workspaceId: WS_ID,
+    workspaceId,
     name,
     displayName: i.displayName?.trim() || name,
     type,
@@ -170,15 +277,22 @@ export async function createAgent(
     color: i.color || palette[Math.floor(Math.random() * palette.length)],
     waitMode: i.waitMode === "bounded" ? "bounded" : "infinite",
   });
-  await db.insert(s.roomMembers).values({ roomId: GENERAL_ID, participantKind: "agent", participantId: id, notifyMode: "mentions_only" }).onConflictDoNothing();
+  const generalId = await generalRoomId(workspaceId);
+  await db.insert(s.roomMembers).values({ roomId: generalId, participantKind: "agent", participantId: id, notifyMode: "mentions_only" }).onConflictDoNothing();
   const tok = await issueToken(id);
-  await audit(actor, "agent.create", id, { name });
-  const agent = await getAgentView(id);
-  await publish("agent.updated", { agent_id: id });
+  await audit(actor, "agent.create", id, { name }, workspaceId);
+  const agent = await getAgentView(id, workspaceId);
+  await publish("agent.updated", { agent_id: id }, workspaceId);
   return { agent, token: tok.token, token_id: tok.id };
 }
 
-export async function updateAgent(actor: Actor, id: string, p: Partial<{ displayName: string; type: string; description: string; capabilities: string[]; color: string; waitMode: string }>) {
+export async function updateAgent(
+  actor: Actor,
+  id: string,
+  p: Partial<{ displayName: string; type: string; description: string; capabilities: string[]; color: string; waitMode: string }>,
+  workspaceId: string = WS_ID,
+) {
+  await requireWorkspaceAgent(workspaceId, id);
   const set: Partial<typeof s.agents.$inferInsert> = {};
   if (p.displayName !== undefined) set.displayName = p.displayName;
   if (p.type !== undefined && AGENT_TYPES.includes(p.type)) set.type = p.type;
@@ -187,50 +301,56 @@ export async function updateAgent(actor: Actor, id: string, p: Partial<{ display
   if (p.color !== undefined) set.color = p.color;
   if (p.waitMode === "infinite" || p.waitMode === "bounded") set.waitMode = p.waitMode;
   if (Object.keys(set).length) await db.update(s.agents).set(set).where(eq(s.agents.id, id));
-  await audit(actor, "agent.update", id, set as Record<string, unknown>);
-  await publish("agent.updated", { agent_id: id });
-  return getAgentView(id);
+  await audit(actor, "agent.update", id, set as Record<string, unknown>, workspaceId);
+  await publish("agent.updated", { agent_id: id }, workspaceId);
+  return getAgentView(id, workspaceId);
 }
 
-export async function deleteAgent(actor: Actor, id: string) {
+export async function deleteAgent(actor: Actor, id: string, workspaceId: string = WS_ID) {
+  await requireWorkspaceAgent(workspaceId, id);
   await db.update(s.agentTokens).set({ revokedAt: new Date() }).where(and(eq(s.agentTokens.agentId, id), isNull(s.agentTokens.revokedAt)));
   await db.update(s.agents).set({ state: "disabled" }).where(eq(s.agents.id, id));
   interruptWaiter(id, "revoked");
-  await audit(actor, "agent.disable", id);
-  await publish("agent.updated", { agent_id: id });
+  await audit(actor, "agent.disable", id, {}, workspaceId);
+  await publish("agent.updated", { agent_id: id }, workspaceId);
 }
 
-export async function setAgentState(actor: Actor, id: string, state: "active" | "paused") {
-  const [a] = await db.select().from(s.agents).where(eq(s.agents.id, id));
-  if (!a) throw new RelayError("not_found", "Agent not found");
+export async function setAgentState(actor: Actor, id: string, state: "active" | "paused", workspaceId: string = WS_ID) {
+  const a = await requireWorkspaceAgent(workspaceId, id);
   if (a.state === "disabled") throw new RelayError("conflict", "Agent is disabled", { status: 409 });
   await db.update(s.agents).set({ state }).where(eq(s.agents.id, id));
-  await audit(actor, state === "paused" ? "agent.pause" : "agent.resume", id);
+  await audit(actor, state === "paused" ? "agent.pause" : "agent.resume", id, {}, workspaceId);
   notifyAgent(id);
-  await publish("presence.updated", { agent_id: id });
-  return getAgentView(id);
+  await publish("presence.updated", { agent_id: id }, workspaceId);
+  return getAgentView(id, workspaceId);
 }
 
-export async function rotateToken(actor: Actor, agentId: string, tokenId?: string) {
+export async function rotateToken(actor: Actor, agentId: string, tokenId?: string, workspaceId?: string) {
+  const wsId = workspaceId ?? (await actorWorkspaceId(actor));
+  await requireWorkspaceAgent(wsId, agentId);
   await db
     .update(s.agentTokens)
     .set({ revokedAt: new Date() })
     .where(and(eq(s.agentTokens.agentId, agentId), isNull(s.agentTokens.revokedAt), tokenId ? eq(s.agentTokens.id, tokenId) : undefined));
   interruptWaiter(agentId, "revoked");
   const tok = await issueToken(agentId);
-  await audit(actor, tokenId ? "token.rotate" : "token.create", agentId, { token_id: tok.id });
-  await publish("agent.updated", { agent_id: agentId });
+  await audit(actor, tokenId ? "token.rotate" : "token.create", agentId, { token_id: tok.id }, wsId);
+  await publish("agent.updated", { agent_id: agentId }, wsId);
   return tok;
 }
 
-export async function addToken(actor: Actor, agentId: string) {
+export async function addToken(actor: Actor, agentId: string, workspaceId?: string) {
+  const wsId = workspaceId ?? (await actorWorkspaceId(actor));
+  await requireWorkspaceAgent(wsId, agentId);
   const tok = await issueToken(agentId);
-  await audit(actor, "token.create", agentId, { token_id: tok.id });
-  await publish("agent.updated", { agent_id: agentId });
+  await audit(actor, "token.create", agentId, { token_id: tok.id }, wsId);
+  await publish("agent.updated", { agent_id: agentId }, wsId);
   return tok;
 }
 
-export async function revokeToken(actor: Actor, agentId: string, tokenId: string) {
+export async function revokeToken(actor: Actor, agentId: string, tokenId: string, workspaceId?: string) {
+  const wsId = workspaceId ?? (await actorWorkspaceId(actor));
+  await requireWorkspaceAgent(wsId, agentId);
   const r = await db
     .update(s.agentTokens)
     .set({ revokedAt: new Date() })
@@ -238,8 +358,8 @@ export async function revokeToken(actor: Actor, agentId: string, tokenId: string
     .returning();
   if (!r.length) throw new RelayError("not_found", "Active token not found");
   interruptWaiter(agentId, "revoked");
-  await audit(actor, "token.revoke", agentId, { token_id: tokenId });
-  await publish("agent.updated", { agent_id: agentId });
+  await audit(actor, "token.revoke", agentId, { token_id: tokenId }, wsId);
+  await publish("agent.updated", { agent_id: agentId }, wsId);
 }
 
 export async function authenticateToken(token: string): Promise<AgentRow | null> {
@@ -265,18 +385,27 @@ export async function touchAgent(agentId: string, force = false) {
   await db.update(s.agents).set({ lastSeenAt: new Date() }).where(eq(s.agents.id, agentId));
 }
 
-export async function setStatus(agentId: string, state: string, activity: string) {
+export async function setStatus(agentId: string, state: string, activity: string, workspaceId?: string) {
   if (!["waiting", "working", "blocked", "error"].includes(state)) throw new RelayError("invalid_input", "state must be waiting|working|blocked|error");
+  const wsId = workspaceId ?? (await agentWorkspaceId(agentId)) ?? undefined;
   await db.update(s.agents).set({ statusState: state, statusActivity: activity.slice(0, 200), lastSeenAt: new Date() }).where(eq(s.agents.id, agentId));
-  await publish("presence.updated", { agent_id: agentId, status: { state, activity } });
+  await publish("presence.updated", { agent_id: agentId, status: { state, activity } }, wsId);
 }
 
-export async function pendingCounts(): Promise<Map<string, number>> {
-  const rows = await db
-    .select({ agentId: s.inboxItems.agentId, n: sql<number>`count(*)::int` })
-    .from(s.inboxItems)
-    .where(or(eq(s.inboxItems.state, "pending"), and(eq(s.inboxItems.state, "delivered"), lt(s.inboxItems.leaseExpiresAt, sql`now()`))))
-    .groupBy(s.inboxItems.agentId);
+export async function pendingCounts(workspaceId?: string): Promise<Map<string, number>> {
+  const pending = or(eq(s.inboxItems.state, "pending"), and(eq(s.inboxItems.state, "delivered"), lt(s.inboxItems.leaseExpiresAt, sql`now()`)));
+  const rows = workspaceId
+    ? await db
+        .select({ agentId: s.inboxItems.agentId, n: sql<number>`count(*)::int` })
+        .from(s.inboxItems)
+        .innerJoin(s.agents, eq(s.agents.id, s.inboxItems.agentId))
+        .where(and(eq(s.agents.workspaceId, workspaceId), pending))
+        .groupBy(s.inboxItems.agentId)
+    : await db
+        .select({ agentId: s.inboxItems.agentId, n: sql<number>`count(*)::int` })
+        .from(s.inboxItems)
+        .where(pending)
+        .groupBy(s.inboxItems.agentId);
   return new Map(rows.map((r) => [r.agentId, r.n]));
 }
 
@@ -301,19 +430,26 @@ export function toAgentView(a: AgentRow, pending = 0) {
   };
 }
 
-export async function getAgentView(id: string) {
-  const [a] = await db.select().from(s.agents).where(eq(s.agents.id, id));
+export async function getAgentView(id: string, workspaceId?: string) {
+  const [a] = await db
+    .select()
+    .from(s.agents)
+    .where(workspaceId ? and(eq(s.agents.id, id), eq(s.agents.workspaceId, workspaceId)) : eq(s.agents.id, id));
   if (!a) throw new RelayError("not_found", "Agent not found");
-  return toAgentView(a, (await pendingCounts()).get(id) ?? 0);
+  return toAgentView(a, (await pendingCounts(a.workspaceId)).get(id) ?? 0);
 }
 
-export async function listAgentViews(includeDisabled = false) {
-  const rows = await db.select().from(s.agents).orderBy(asc(s.agents.name));
-  const pc = await pendingCounts();
+export async function listAgentViews(includeDisabled = false, workspaceId?: string) {
+  const rows = await db
+    .select()
+    .from(s.agents)
+    .where(workspaceId ? eq(s.agents.workspaceId, workspaceId) : undefined)
+    .orderBy(asc(s.agents.name));
+  const pc = await pendingCounts(workspaceId);
   const tokens = await db
     .select({ id: s.agentTokens.id, agentId: s.agentTokens.agentId, prefix: s.agentTokens.prefix, lastUsedAt: s.agentTokens.lastUsedAt, createdAt: s.agentTokens.createdAt })
     .from(s.agentTokens)
-    .where(isNull(s.agentTokens.revokedAt));
+    .where(and(isNull(s.agentTokens.revokedAt), workspaceId ? inArray(s.agentTokens.agentId, rows.map((r) => r.id).concat("none")) : undefined));
   return rows
     .filter((a) => includeDisabled || a.state !== "disabled")
     .map((a) => ({
@@ -322,9 +458,9 @@ export async function listAgentViews(includeDisabled = false) {
     }));
 }
 
-export async function listParticipants(includeOffline = true) {
-  const agents = (await listAgentViews()).filter((a) => includeOffline || a.presence !== "offline");
-  const users = await db.select().from(s.users);
+export async function listParticipants(includeOffline = true, workspaceId?: string) {
+  const agents = (await listAgentViews(false, workspaceId)).filter((a) => includeOffline || a.presence !== "offline");
+  const users = await db.select().from(s.users).where(workspaceId ? eq(s.users.workspaceId, workspaceId) : undefined);
   return {
     agents: agents.map((a) => ({ name: a.name, kind: "agent", type: a.type, capabilities: a.capabilities, presence: a.presence, status: a.status, state: a.state, description: a.description })),
     humans: users.map((u) => ({ name: userHandle(u), kind: "user", display_name: u.name })),
@@ -354,14 +490,22 @@ export function toRoomView(r: RoomRow, memberCount?: number) {
   };
 }
 
-export async function getRoom(id: string, d: DbLike = db) {
-  const [r] = await d.select().from(s.rooms).where(eq(s.rooms.id, id));
+/**
+ * Load a room. With a workspaceId the room must belong to that workspace; a room id from another
+ * workspace is reported exactly like a missing room (404) so ids do not leak across tenants.
+ */
+export async function getRoom(id: string, d: DbLike = db, workspaceId?: string) {
+  const [r] = await d
+    .select()
+    .from(s.rooms)
+    .where(workspaceId ? and(eq(s.rooms.id, id), eq(s.rooms.workspaceId, workspaceId)) : eq(s.rooms.id, id));
   if (!r) throw new RelayError("not_found", "Room not found");
   return r;
 }
 
-export async function getMembers(roomId: string) {
-  const rows = await db.select().from(s.roomMembers).where(eq(s.roomMembers.roomId, roomId));
+export async function getMembers(roomId: string, workspaceId?: string) {
+  const room = await getRoom(roomId, db, workspaceId);
+  const rows = await db.select().from(s.roomMembers).where(eq(s.roomMembers.roomId, room.id));
   const agentIds = rows.filter((m) => m.participantKind === "agent").map((m) => m.participantId);
   const userIds = rows.filter((m) => m.participantKind === "user").map((m) => m.participantId);
   const agents = agentIds.length ? await db.select().from(s.agents).where(inArray(s.agents.id, agentIds)) : [];
@@ -384,61 +528,77 @@ export async function isMember(roomId: string, kind: "agent" | "user", id: strin
   return !!m;
 }
 
-export async function assertMember(roomId: string, actor: Actor) {
+export async function assertMember(roomId: string, actor: Actor, workspaceId?: string) {
+  const wsId = workspaceId ?? (await actorWorkspaceId(actor));
+  await getRoom(roomId, db, wsId); // foreign room id → 404, never a different error
   if (actor.kind === "user") return;
   if (!(await isMember(roomId, "agent", actor.id))) throw new RelayError("forbidden", "You are not a member of this room", { status: 403 });
 }
 
-export async function resolveParticipant(name: string): Promise<{ kind: "agent" | "user"; id: string; name: string }> {
+/** Resolve @name / email / handle to a participant *within one workspace* only. */
+export async function resolveParticipant(name: string, workspaceId: string): Promise<{ kind: "agent" | "user"; id: string; name: string }> {
   const n = name.trim().replace(/^@/, "").toLowerCase();
-  const [a] = await db.select().from(s.agents).where(eq(s.agents.name, n));
+  const [a] = await db.select().from(s.agents).where(and(eq(s.agents.workspaceId, workspaceId), eq(s.agents.name, n)));
   if (a && a.state !== "disabled") return { kind: "agent", id: a.id, name: a.name };
-  const users = await db.select().from(s.users);
+  const users = await db.select().from(s.users).where(eq(s.users.workspaceId, workspaceId));
   const u = users.find((x) => userHandle(x) === n || x.email === n || x.name.toLowerCase() === n);
   if (u) return { kind: "user", id: u.id, name: userHandle(u) };
   throw new RelayError("recipient_not_found", `No agent or human named '${name}'. Call list_agents to see valid names.`);
 }
 
-export async function addMember(actor: Actor, roomId: string, kind: "agent" | "user", id: string, notify?: NotifyMode) {
-  const room = await getRoom(roomId);
+export async function addMember(actor: Actor, roomId: string, kind: "agent" | "user", id: string, notify?: NotifyMode, workspaceId?: string) {
+  const wsId = workspaceId ?? (await actorWorkspaceId(actor));
+  const room = await getRoom(roomId, db, wsId);
+  // Participants must belong to the same workspace as the room.
+  if (kind === "agent") await requireWorkspaceAgent(wsId, id);
+  else {
+    const [u] = await db.select({ id: s.users.id }).from(s.users).where(and(eq(s.users.id, id), eq(s.users.workspaceId, wsId)));
+    if (!u) throw new RelayError("not_found", "User not found");
+  }
   if (room.kind === "dm") throw new RelayError("invalid_input", "Cannot change members of a DM");
   await db
     .insert(s.roomMembers)
     .values({ roomId, participantKind: kind, participantId: id, notifyMode: notify ?? (kind === "user" ? "all" : "mentions_only") })
     .onConflictDoNothing();
-  await audit(actor, "room.member_add", roomId, { kind, id });
-  await publish("room.updated", { room_id: roomId });
+  await audit(actor, "room.member_add", roomId, { kind, id }, wsId);
+  await publish("room.updated", { room_id: roomId }, wsId);
 }
 
-export async function removeMember(actor: Actor, roomId: string, kind: "agent" | "user", id: string) {
+export async function removeMember(actor: Actor, roomId: string, kind: "agent" | "user", id: string, workspaceId?: string) {
+  const wsId = workspaceId ?? (await actorWorkspaceId(actor));
+  await getRoom(roomId, db, wsId);
   await db.delete(s.roomMembers).where(and(eq(s.roomMembers.roomId, roomId), eq(s.roomMembers.participantKind, kind), eq(s.roomMembers.participantId, id)));
-  await audit(actor, "room.member_remove", roomId, { kind, id });
-  await publish("room.updated", { room_id: roomId });
+  await audit(actor, "room.member_remove", roomId, { kind, id }, wsId);
+  await publish("room.updated", { room_id: roomId }, wsId);
 }
 
-export async function setNotifyMode(roomId: string, kind: "agent" | "user", id: string, mode: NotifyMode) {
+export async function setNotifyMode(roomId: string, kind: "agent" | "user", id: string, mode: NotifyMode, workspaceId: string) {
   if (!["all", "mentions_only", "none"].includes(mode)) throw new RelayError("invalid_input", "invalid notify mode");
+  const wsId = workspaceId;
+  await getRoom(roomId, db, wsId);
   await db
     .update(s.roomMembers)
     .set({ notifyMode: mode })
     .where(and(eq(s.roomMembers.roomId, roomId), eq(s.roomMembers.participantKind, kind), eq(s.roomMembers.participantId, id)));
-  await publish("room.updated", { room_id: roomId });
+  await publish("room.updated", { room_id: roomId }, wsId);
 }
 
 export async function createRoom(
   actor: Actor,
   i: { name: string; topic?: string; pinnedInstructions?: string; members?: string[]; visibility?: string; hopLimit?: number },
+  workspaceId?: string,
 ) {
   await ensureWorkspace();
+  const wsId = workspaceId ?? (await actorWorkspaceId(actor));
   const name = i.name.trim().replace(/^#/, "").toLowerCase();
   if (!/^[a-z0-9][a-z0-9_-]{0,47}$/.test(name)) throw new RelayError("invalid_input", "room name must be a slug (a-z, 0-9, _ -)");
-  const [dupe] = await db.select().from(s.rooms).where(and(eq(s.rooms.name, name), eq(s.rooms.kind, "group")));
+  const [dupe] = await db.select().from(s.rooms).where(and(eq(s.rooms.workspaceId, wsId), eq(s.rooms.name, name), eq(s.rooms.kind, "group")));
   if (dupe) throw new RelayError("conflict", `Room '${name}' already exists`, { status: 409 });
-  const st = await getSettings();
+  const st = await getSettings(wsId);
   const id = newId("room");
   await db.insert(s.rooms).values({
     id,
-    workspaceId: WS_ID,
+    workspaceId: wsId,
     name,
     topic: i.topic ?? "",
     pinnedInstructions: i.pinnedInstructions ?? "",
@@ -448,19 +608,22 @@ export async function createRoom(
   });
   await db.insert(s.roomMembers).values({ roomId: id, participantKind: actor.kind, participantId: actor.id, notifyMode: actor.kind === "user" ? "all" : "mentions_only" }).onConflictDoNothing();
   for (const m of i.members ?? []) {
-    const p = await resolveParticipant(m);
+    const p = await resolveParticipant(m, wsId);
     await db.insert(s.roomMembers).values({ roomId: id, participantKind: p.kind, participantId: p.id, notifyMode: p.kind === "user" ? "all" : "mentions_only" }).onConflictDoNothing();
   }
-  await audit(actor, "room.create", id, { name });
-  await publish("room.updated", { room_id: id });
-  return toRoomView(await getRoom(id));
+  await audit(actor, "room.create", id, { name }, wsId);
+  await publish("room.updated", { room_id: id }, wsId);
+  return toRoomView(await getRoom(id, db, wsId));
 }
 
 export async function updateRoom(
   actor: Actor,
   id: string,
   p: Partial<{ topic: string; pinnedInstructions: string; hopLimit: number; humansWakeAll: boolean | null; state: string; visibility: string; name: string }>,
+  workspaceId?: string,
 ) {
+  const wsId = workspaceId ?? (await actorWorkspaceId(actor));
+  await getRoom(id, db, wsId);
   const set: Partial<typeof s.rooms.$inferInsert> = {};
   if (p.topic !== undefined) set.topic = p.topic;
   if (p.pinnedInstructions !== undefined) set.pinnedInstructions = p.pinnedInstructions;
@@ -468,31 +631,37 @@ export async function updateRoom(
   if (p.humansWakeAll !== undefined) set.humansWakeAll = p.humansWakeAll;
   if (p.visibility === "open" || p.visibility === "private") set.visibility = p.visibility;
   if (p.name) set.name = p.name.replace(/^#/, "").toLowerCase();
-  if (p.state === "archived" || (p.state === "active" && (await getRoom(id)).state === "archived")) set.state = p.state;
+  if (p.state === "archived" || (p.state === "active" && (await getRoom(id, db, wsId)).state === "archived")) set.state = p.state;
   if (Object.keys(set).length) await db.update(s.rooms).set(set).where(eq(s.rooms.id, id));
-  await audit(actor, "room.update", id, set as Record<string, unknown>);
-  await publish("room.updated", { room_id: id });
-  return toRoomView(await getRoom(id));
+  await audit(actor, "room.update", id, set as Record<string, unknown>, wsId);
+  await publish("room.updated", { room_id: id }, wsId);
+  return toRoomView(await getRoom(id, db, wsId));
 }
 
-export async function setRoomState(actor: Actor, id: string, state: "paused" | "active", reason = "operator") {
-  const room = await getRoom(id);
+export async function setRoomState(actor: Actor, id: string, state: "paused" | "active", reason = "operator", workspaceId?: string) {
+  const wsId = workspaceId ?? (await actorWorkspaceId(actor));
+  const room = await getRoom(id, db, wsId);
   if (room.state === "archived") throw new RelayError("conflict", "Room is archived", { status: 409 });
   await db
     .update(s.rooms)
     .set({ state, pauseReason: state === "paused" ? reason : "", hopCount: state === "active" ? 0 : room.hopCount })
     .where(eq(s.rooms.id, id));
-  await audit(actor, state === "paused" ? "room.pause" : "room.resume", id, { reason });
-  await sendMessage(SYSTEM, { roomId: id, content: state === "paused" ? `Room paused by ${actor.name}.` : `Room resumed by ${actor.name}.`, type: "system", skipGuards: true });
-  await publish(state === "paused" ? "room.paused" : "room.resumed", { room_id: id, reason });
-  return toRoomView(await getRoom(id));
+  await audit(actor, state === "paused" ? "room.pause" : "room.resume", id, { reason }, wsId);
+  await sendMessage(SYSTEM, { roomId: id, content: state === "paused" ? `Room paused by ${actor.name}.` : `Room resumed by ${actor.name}.`, type: "system", skipGuards: true }, wsId);
+  await publish(state === "paused" ? "room.paused" : "room.resumed", { room_id: id, reason }, wsId);
+  return toRoomView(await getRoom(id, db, wsId));
 }
 
-export async function listRoomsFor(actor: Actor, scope: "mine" | "open" | "all" = "mine") {
-  const rooms = await db.select().from(s.rooms).where(sql`${s.rooms.state} <> 'archived'`).orderBy(asc(s.rooms.name));
-  const members = await db.select().from(s.roomMembers);
-  const agents = await db.select().from(s.agents);
-  const users = await db.select().from(s.users);
+export async function listRoomsFor(actor: Actor, scope: "mine" | "open" | "all" = "mine", workspaceId?: string) {
+  const wsId = workspaceId ?? (await actorWorkspaceId(actor));
+  const rooms = await db
+    .select()
+    .from(s.rooms)
+    .where(and(eq(s.rooms.workspaceId, wsId), sql`${s.rooms.state} <> 'archived'`))
+    .orderBy(asc(s.rooms.name));
+  const members = await db.select().from(s.roomMembers).where(inArray(s.roomMembers.roomId, rooms.map((r) => r.id).concat("none")));
+  const agents = await db.select().from(s.agents).where(eq(s.agents.workspaceId, wsId));
+  const users = await db.select().from(s.users).where(eq(s.users.workspaceId, wsId));
   const out = [];
   for (const r of rooms) {
     const ms = members.filter((m) => m.roomId === r.id);
@@ -508,35 +677,35 @@ export async function listRoomsFor(actor: Actor, scope: "mine" | "open" | "all" 
 }
 
 export async function joinRoom(agent: AgentRow, roomId: string) {
-  const room = await getRoom(roomId);
+  const room = await getRoom(roomId, db, agent.workspaceId);
   if (room.kind !== "group" || room.visibility !== "open" || room.state === "archived") throw new RelayError("forbidden", "Room is not open for joining", { status: 403 });
   await db.insert(s.roomMembers).values({ roomId, participantKind: "agent", participantId: agent.id, notifyMode: "mentions_only" }).onConflictDoNothing();
-  await publish("room.updated", { room_id: roomId });
+  await publish("room.updated", { room_id: roomId }, agent.workspaceId);
   return toRoomView(room);
 }
 export async function leaveRoom(agent: AgentRow, roomId: string) {
-  const room = await getRoom(roomId);
+  const room = await getRoom(roomId, db, agent.workspaceId);
   if (room.kind === "dm") throw new RelayError("invalid_input", "Cannot leave a DM");
   await db.delete(s.roomMembers).where(and(eq(s.roomMembers.roomId, roomId), eq(s.roomMembers.participantKind, "agent"), eq(s.roomMembers.participantId, agent.id)));
-  await publish("room.updated", { room_id: roomId });
+  await publish("room.updated", { room_id: roomId }, agent.workspaceId);
   return toRoomView(room);
 }
 
-export async function getRoomContext(roomId: string) {
-  const room = await getRoom(roomId);
-  return { room: toRoomView(room), topic: room.topic, pinned_instructions: room.pinnedInstructions, members: await getMembers(roomId) };
+export async function getRoomContext(roomId: string, workspaceId: string) {
+  const room = await getRoom(roomId, db, workspaceId);
+  return { room: toRoomView(room), topic: room.topic, pinned_instructions: room.pinnedInstructions, members: await getMembers(roomId, workspaceId) };
 }
 
-async function getOrCreateDm(a: { kind: "agent" | "user"; id: string }, b: { kind: "agent" | "user"; id: string }) {
-  const key = [`${a.kind}:${a.id}`, `${b.kind}:${b.id}`].sort().join("|");
-  const [ex] = await db.select().from(s.rooms).where(eq(s.rooms.dmKey, key));
+async function getOrCreateDm(a: { kind: "agent" | "user"; id: string }, b: { kind: "agent" | "user"; id: string }, workspaceId: string) {
+  const key = [`${workspaceId}|${a.kind}:${a.id}`, `${b.kind}:${b.id}`].sort().join("|");
+  const [ex] = await db.select().from(s.rooms).where(and(eq(s.rooms.workspaceId, workspaceId), eq(s.rooms.dmKey, key)));
   if (ex) return ex;
   const id = newId("room");
-  const st = await getSettings();
-  await db.insert(s.rooms).values({ id, workspaceId: WS_ID, name: "dm", kind: "dm", dmKey: key, visibility: "private", hopLimit: st.hopLimit, createdBy: `${a.kind}:${a.id}` }).onConflictDoNothing();
-  const room = await db.select().from(s.rooms).where(eq(s.rooms.dmKey, key));
+  const st = await getSettings(workspaceId);
+  await db.insert(s.rooms).values({ id, workspaceId, name: "dm", kind: "dm", dmKey: key, visibility: "private", hopLimit: st.hopLimit, createdBy: `${a.kind}:${a.id}` }).onConflictDoNothing();
+  const room = await db.select().from(s.rooms).where(and(eq(s.rooms.workspaceId, workspaceId), eq(s.rooms.dmKey, key)));
   for (const p of [a, b]) await db.insert(s.roomMembers).values({ roomId: room[0].id, participantKind: p.kind, participantId: p.id, notifyMode: "all" }).onConflictDoNothing();
-  await publish("room.updated", { room_id: room[0].id });
+  await publish("room.updated", { room_id: room[0].id }, workspaceId);
   return room[0];
 }
 
@@ -608,8 +777,12 @@ export interface SendParams {
 }
 const MSG_TYPES = ["chat", "task", "result", "status", "system", "human_request"];
 
-export async function sendMessage(sender: Sender, p: SendParams) {
+export async function sendMessage(sender: Sender, p: SendParams, workspaceId?: string) {
   await ensureWorkspace();
+  // Workspace of the sender: explicit (system/loop-guard messages), the user's workspace, or the agent's.
+  const wsId =
+    workspaceId ??
+    (sender.kind === "system" ? p.roomId ? (await db.select({ w: s.rooms.workspaceId }).from(s.rooms).where(eq(s.rooms.id, p.roomId)))[0]?.w : WS_ID : await actorWorkspaceId(sender as Actor));
   const type = p.type ?? "chat";
   if (!MSG_TYPES.includes(type)) throw new RelayError("invalid_input", `type must be one of ${MSG_TYPES.join(", ")}`);
   if (sender.kind === "user" && (type === "task" || type === "human_request" || type === "result")) {
@@ -621,19 +794,20 @@ export async function sendMessage(sender: Sender, p: SendParams) {
   if (p.metadata && Buffer.byteLength(JSON.stringify(p.metadata)) > config.maxMetadataBytes) throw new RelayError("payload_too_large", "metadata exceeds 16 KB");
 
   let roomId = p.roomId;
+  if (roomId) await getRoom(roomId, db, wsId ?? undefined); // foreign room id → 404
   if (!roomId) {
     if (!p.to) throw new RelayError("invalid_input", "Provide room_id or to");
-    const target = await resolveParticipant(p.to);
-    if (target.kind === sender.kind && target.id === sender.id) throw new RelayError("invalid_input", "Cannot message yourself");
     if (sender.kind === "system") throw new RelayError("invalid_input", "system needs room_id");
-    roomId = (await getOrCreateDm(sender as { kind: "agent" | "user"; id: string }, target)).id;
+    const target = await resolveParticipant(p.to, wsId!);
+    if (target.kind === sender.kind && target.id === sender.id) throw new RelayError("invalid_input", "Cannot message yourself");
+    roomId = (await getOrCreateDm(sender as { kind: "agent" | "user"; id: string }, target, wsId!)).id;
   }
   const rid = roomId;
   if (sender.kind === "agent" && !(await isMember(rid, "agent", sender.id))) throw new RelayError("forbidden", "You are not a member of this room", { status: 403 });
   if (sender.kind === "user" && !(await isMember(rid, "user", sender.id))) {
     await db.insert(s.roomMembers).values({ roomId: rid, participantKind: "user", participantId: sender.id, notifyMode: "all" }).onConflictDoNothing();
   }
-  const st = await getSettings();
+  const st = await getSettings(wsId ?? WS_ID);
 
   const result = await db.transaction(async (tx) => {
     const [room] = await tx.select().from(s.rooms).where(eq(s.rooms.id, rid)).for("update");
@@ -660,8 +834,8 @@ export async function sendMessage(sender: Sender, p: SendParams) {
     const warnings: string[] = [];
     const mentioned: { kind: "agent" | "user"; id: string }[] = [];
     if (names.length) {
-      const ags = await tx.select().from(s.agents).where(inArray(s.agents.name, names));
-      const usrs = (await tx.select().from(s.users)).filter((u) => names.includes(userHandle(u)));
+      const ags = await tx.select().from(s.agents).where(and(wsId ? eq(s.agents.workspaceId, wsId) : undefined, inArray(s.agents.name, names)));
+      const usrs = (await tx.select().from(s.users).where(wsId ? eq(s.users.workspaceId, wsId) : undefined)).filter((u) => names.includes(userHandle(u)));
       for (const a of ags) {
         mentioned.push({ kind: "agent", id: a.id });
         if (!members.some((m) => m.participantKind === "agent" && m.participantId === a.id)) {
@@ -698,7 +872,11 @@ export async function sendMessage(sender: Sender, p: SendParams) {
       .returning();
     if (mentioned.length) await tx.insert(s.messageMentions).values(mentioned.map((m) => ({ messageId: id, participantKind: m.kind, participantId: m.id }))).onConflictDoNothing();
     if (p.attachments?.length) {
-      const found = await tx.select({ id: s.artifacts.id }).from(s.artifacts).where(inArray(s.artifacts.id, p.attachments));
+      const roomIds = (await tx.select({ id: s.rooms.id }).from(s.rooms).where(wsId ? eq(s.rooms.workspaceId, wsId) : undefined)).map((r) => r.id);
+      const found = await tx
+        .select({ id: s.artifacts.id })
+        .from(s.artifacts)
+        .where(and(inArray(s.artifacts.id, p.attachments), inArray(s.artifacts.roomId, roomIds.concat("none"))));
       if (found.length !== new Set(p.attachments).size) throw new RelayError("not_found", "One or more attachments do not exist");
       await tx.insert(s.messageAttachments).values(found.map((f) => ({ messageId: id, artifactId: f.id }))).onConflictDoNothing();
     }
@@ -760,12 +938,12 @@ export async function sendMessage(sender: Sender, p: SendParams) {
 
   if (!result.deduplicated) {
     const [view] = await hydrate([result.row]);
-    await publish("message.created", { room_id: rid, message: view });
+    await publish("message.created", { room_id: rid, message: view }, wsId ?? undefined);
     for (const a of result.recipients) notifyAgent(a);
-    if (result.tripped) await publish("room.paused", { room_id: rid, reason: "loop_guard" });
-    if (result.resumed) await publish("room.resumed", { room_id: rid });
-    if (result.tripped || result.resumed) await publish("message.created", { room_id: rid, refresh: true });
-    if (result.tripped) await audit({ kind: "system", id: "system" }, "room.pause", rid, { reason: "loop_guard" });
+    if (result.tripped) await publish("room.paused", { room_id: rid, reason: "loop_guard" }, wsId ?? undefined);
+    if (result.resumed) await publish("room.resumed", { room_id: rid }, wsId ?? undefined);
+    if (result.tripped || result.resumed) await publish("message.created", { room_id: rid, refresh: true }, wsId ?? undefined);
+    if (result.tripped) await audit({ kind: "system", id: "system" }, "room.pause", rid, { reason: "loop_guard" }, wsId ?? undefined);
     if (sender.kind === "agent") await touchAgent(sender.id);
   }
   return {
@@ -777,7 +955,8 @@ export async function sendMessage(sender: Sender, p: SendParams) {
   };
 }
 
-export async function readMessages(roomId: string, o: { beforeSeq?: number; afterSeq?: number; limit?: number; threadId?: string } = {}) {
+export async function readMessages(roomId: string, o: { beforeSeq?: number; afterSeq?: number; limit?: number; threadId?: string } = {}, workspaceId?: string) {
+  if (workspaceId) await getRoom(roomId, db, workspaceId);
   const limit = Math.min(Math.max(o.limit ?? 50, 1), 200);
   const conds = [eq(s.messages.roomId, roomId)];
   if (o.beforeSeq) conds.push(sql`${s.messages.seq} < ${o.beforeSeq}`);
@@ -797,7 +976,9 @@ export async function readMessages(roomId: string, o: { beforeSeq?: number; afte
 }
 
 export async function searchMessages(actor: Actor, q: string, o: { roomId?: string; from?: string; limit?: number } = {}) {
-  const conds = [isNull(s.messages.deletedAt)];
+  const wsId = await actorWorkspaceId(actor);
+  const wsRooms = (await db.select({ id: s.rooms.id }).from(s.rooms).where(eq(s.rooms.workspaceId, wsId))).map((r) => r.id);
+  const conds = [isNull(s.messages.deletedAt), inArray(s.messages.roomId, wsRooms.concat("none"))];
   const like = `%${q.replace(/[%_\\]/g, (c) => `\\${c}`)}%`;
   conds.push(sql`(to_tsvector('simple', ${s.messages.content}) @@ plainto_tsquery('simple', ${q}) OR ${s.messages.content} ILIKE ${like})`);
   if (o.roomId) conds.push(eq(s.messages.roomId, o.roomId));
@@ -807,7 +988,7 @@ export async function searchMessages(actor: Actor, q: string, o: { roomId?: stri
     conds.push(inArray(s.messages.roomId, mine.map((m) => m.r)));
   }
   if (o.from) {
-    const p = await resolveParticipant(o.from).catch(() => null);
+    const p = await resolveParticipant(o.from, wsId).catch(() => null);
     if (!p) return [];
     conds.push(eq(s.messages.senderId, p.id));
   }
@@ -815,21 +996,36 @@ export async function searchMessages(actor: Actor, q: string, o: { roomId?: stri
   return hydrate(rows);
 }
 
+/** Message ids are only actionable inside the caller's workspace; foreign ids answer 404. */
+async function requireWorkspaceMessage(workspaceId: string, id: string) {
+  const [r] = await db
+    .select({ m: s.messages, roomId: s.rooms.id })
+    .from(s.messages)
+    .innerJoin(s.rooms, eq(s.rooms.id, s.messages.roomId))
+    .where(and(eq(s.messages.id, id), eq(s.rooms.workspaceId, workspaceId)));
+  if (!r) throw new RelayError("not_found", "Message not found");
+  return r.m;
+}
+
 export async function editMessage(actor: Actor, id: string, content: string) {
   if (Buffer.byteLength(content) > config.maxContentBytes) throw new RelayError("payload_too_large", "content too large");
+  const wsId = await actorWorkspaceId(actor);
+  await requireWorkspaceMessage(wsId, id);
   const [r] = await db.update(s.messages).set({ content, editedAt: new Date() }).where(and(eq(s.messages.id, id), isNull(s.messages.deletedAt))).returning();
   if (!r) throw new RelayError("not_found", "Message not found");
-  await audit(actor, "message.edit", id);
+  await audit(actor, "message.edit", id, {}, wsId);
   const [v] = await hydrate([r]);
-  await publish("message.updated", { room_id: r.roomId, message: v });
+  await publish("message.updated", { room_id: r.roomId, message: v }, wsId);
   return v;
 }
 export async function deleteMessage(actor: Actor, id: string) {
+  const wsId = await actorWorkspaceId(actor);
+  await requireWorkspaceMessage(wsId, id);
   const [r] = await db.update(s.messages).set({ deletedAt: new Date() }).where(eq(s.messages.id, id)).returning();
   if (!r) throw new RelayError("not_found", "Message not found");
-  await audit(actor, "message.delete", id, { room_id: r.roomId });
+  await audit(actor, "message.delete", id, { room_id: r.roomId }, wsId);
   const [v] = await hydrate([r]);
-  await publish("message.updated", { room_id: r.roomId, message: v });
+  await publish("message.updated", { room_id: r.roomId, message: v }, wsId);
 }
 
 // ───────────────────────── tasks ─────────────────────────
@@ -868,14 +1064,15 @@ export async function createTask(
   actor: Actor,
   i: { title: string; description?: string; assignee: string; roomId?: string; priority?: string; acceptanceCriteria?: string; due?: string; parentTaskId?: string },
 ) {
+  const wsId = await actorWorkspaceId(actor);
   if (!i.title?.trim()) throw new RelayError("invalid_input", "title required");
-  const target = await resolveParticipant(i.assignee);
+  const target = await resolveParticipant(i.assignee, wsId);
   if (target.kind !== "agent") throw new RelayError("invalid_input", "Tasks can only be assigned to agents");
   let roomId = i.roomId;
   if (roomId) {
-    await assertMember(roomId, actor);
-    if (!(await isMember(roomId, "agent", target.id))) await addMember(actor, roomId, "agent", target.id);
-  } else roomId = (await getOrCreateDm(actor, target)).id;
+    await assertMember(roomId, actor, wsId);
+    if (!(await isMember(roomId, "agent", target.id))) await addMember(actor, roomId, "agent", target.id, undefined, wsId);
+  } else roomId = (await getOrCreateDm(actor, target, wsId)).id;
   const priority = i.priority === "urgent" || i.priority === "low" || i.priority === "high" ? i.priority : "normal";
   const id = newId("task");
   const due = i.due ? new Date(i.due) : null;
@@ -898,15 +1095,20 @@ export async function createTask(
     })
     .returning();
   const content = [`**Task: ${t.title}** (\`${id}\`, priority ${priority})`, "", t.description, t.acceptanceCriteria ? `\n**Acceptance criteria:**\n${t.acceptanceCriteria}` : "", due ? `\n**Due:** ${due.toISOString()}` : ""].join("\n").trim();
-  await sendMessage(actor, { roomId, content, type: "task", taskId: id, metadata: { task_id: id, assignee: target.name }, forceRecipients: [target.id], priority: priority === "urgent" ? "urgent" : "normal", skipGuards: actor.kind === "user" ? false : false });
-  await audit(actor, "task.create", id, { assignee: target.name });
+  await sendMessage(actor, { roomId, content, type: "task", taskId: id, metadata: { task_id: id, assignee: target.name }, forceRecipients: [target.id], priority: priority === "urgent" ? "urgent" : "normal", skipGuards: actor.kind === "user" ? false : false }, wsId);
+  await audit(actor, "task.create", id, { assignee: target.name }, wsId);
   const v = await taskView(t);
-  await publish("task.updated", { task: v });
+  await publish("task.updated", { task: v }, wsId);
   return v;
 }
 
 export async function updateTask(actor: Actor, id: string, p: { status?: string; resultSummary?: string; artifacts?: string[]; note?: string }) {
-  const [t] = await db.select().from(s.tasks).where(eq(s.tasks.id, id));
+  const wsId = await actorWorkspaceId(actor);
+  const wsRooms = (await db.select({ id: s.rooms.id }).from(s.rooms).where(eq(s.rooms.workspaceId, wsId))).map((r) => r.id);
+  const [t] = await db
+    .select()
+    .from(s.tasks)
+    .where(and(eq(s.tasks.id, id), inArray(s.tasks.roomId, wsRooms.concat("none"))));
   if (!t) throw new RelayError("not_found", "Task not found");
   if (actor.kind === "agent" && actor.id !== t.assigneeAgentId && !(t.creatorKind === "agent" && t.creatorId === actor.id))
     throw new RelayError("forbidden", "Only the assignee or creator can update this task", { status: 403 });
@@ -926,20 +1128,23 @@ export async function updateTask(actor: Actor, id: string, p: { status?: string;
   if (t.creatorKind === "agent" && t.creatorId !== actor.id) force.push(t.creatorId);
   if (actor.kind === "user") force.push(t.assigneeAgentId);
   try {
-    await sendMessage(actor, { roomId: t.roomId, content: lines.join("\n"), type: final ? "result" : "status", taskId: id, metadata: { task_id: id, status }, forceRecipients: force, attachments: p.artifacts, priority: final ? "urgent" : "normal", skipGuards: false });
+    await sendMessage(actor, { roomId: t.roomId, content: lines.join("\n"), type: final ? "result" : "status", taskId: id, metadata: { task_id: id, status }, forceRecipients: force, attachments: p.artifacts, priority: final ? "urgent" : "normal", skipGuards: false }, wsId);
   } catch (e) {
     if (!(e instanceof RelayError && (e.code === "room_paused" || e.code === "duplicate_message"))) throw e;
   }
-  await audit(actor, "task.update", id, { status });
+  await audit(actor, "task.update", id, { status }, wsId);
   const v = await taskView(u);
-  await publish("task.updated", { task: v });
+  await publish("task.updated", { task: v }, wsId);
   return v;
 }
 
-export async function listTasks(f: { assignee?: string; status?: string; roomId?: string; actor?: Actor } = {}) {
-  const conds = [];
+export async function listTasks(f: { assignee?: string; status?: string; roomId?: string; actor?: Actor } = {}, workspaceId?: string) {
+  const wsId = workspaceId ?? (f.actor ? await actorWorkspaceId(f.actor) : undefined);
+  // Never list tasks across workspaces: restrict to this workspace's rooms.
+  const wsRooms = wsId ? (await db.select({ id: s.rooms.id }).from(s.rooms).where(eq(s.rooms.workspaceId, wsId))).map((r) => r.id) : null;
+  const conds = wsRooms ? [inArray(s.tasks.roomId, wsRooms.concat("none"))] : [];
   if (f.assignee) {
-    const p = await resolveParticipant(f.assignee).catch(() => null);
+    const p = wsId ? await resolveParticipant(f.assignee, wsId).catch(() => null) : null;
     conds.push(eq(s.tasks.assigneeAgentId, p?.id ?? "none"));
   }
   if (f.status) conds.push(eq(s.tasks.status, f.status));
@@ -954,18 +1159,19 @@ export async function listTasks(f: { assignee?: string; status?: string; roomId?
 
 // ───────────────────────── artifacts ─────────────────────────
 export async function uploadArtifact(actor: Actor, i: { name: string; mime?: string; contentText?: string; contentBase64?: string; roomId?: string }) {
+  const wsId = await actorWorkspaceId(actor);
   let buf: Buffer;
   if (i.contentText !== undefined) buf = Buffer.from(i.contentText, "utf8");
   else if (i.contentBase64 !== undefined) buf = Buffer.from(i.contentBase64, "base64");
   else throw new RelayError("invalid_input", "Provide content_text or content_base64");
   if (buf.length > config.maxArtifactBytes) throw new RelayError("payload_too_large", `Artifact exceeds ${config.maxArtifactBytes} bytes`);
-  const roomId = i.roomId ?? GENERAL_ID;
-  await assertMember(roomId, actor);
+  const roomId = i.roomId ?? (await generalRoomId(wsId));
+  await assertMember(roomId, actor, wsId);
   const id = newId("art");
   const name = i.name.replace(/[\\/\0]/g, "_").slice(0, 200) || "file";
   const mime = i.mime || (i.contentText !== undefined ? "text/plain" : "application/octet-stream");
   await db.insert(s.artifacts).values({ id, roomId, uploaderKind: actor.kind, uploaderId: actor.id, name, mime, size: buf.length, storageKey: `db:${id}`, sha256: sha256(buf), content: buf });
-  await audit(actor, "artifact.upload", id, { name, size: buf.length });
+  await audit(actor, "artifact.upload", id, { name, size: buf.length }, wsId);
   return { id, name, mime, size: buf.length, sha256: sha256(buf), room_id: roomId, url: artifactUrl(id, true) };
 }
 
@@ -986,17 +1192,28 @@ export function artifactUrl(id: string, signed = false) {
 }
 const isTextual = (m: string) => m.startsWith("text/") || /json|xml|javascript|yaml|x-sh|diff|patch|markdown/.test(m);
 
-export async function getArtifactBlob(actor: Actor, id: string) {
-  const [a] = await db.select().from(s.artifacts).where(eq(s.artifacts.id, id));
+/** Load an artifact whose room belongs to the actor's workspace (foreign ids answer 404). */
+async function requireWorkspaceArtifact(workspaceId: string, id: string) {
+  const [a] = await db
+    .select({ a: s.artifacts })
+    .from(s.artifacts)
+    .innerJoin(s.rooms, eq(s.rooms.id, s.artifacts.roomId))
+    .where(and(eq(s.artifacts.id, id), eq(s.rooms.workspaceId, workspaceId)));
   if (!a) throw new RelayError("not_found", "Artifact not found");
-  await assertMember(a.roomId, actor);
+  return a.a;
+}
+
+export async function getArtifactBlob(actor: Actor, id: string) {
+  const wsId = await actorWorkspaceId(actor);
+  const a = await requireWorkspaceArtifact(wsId, id);
+  await assertMember(a.roomId, actor, wsId);
   return { meta: { name: a.name, mime: a.mime }, content: a.content };
 }
 
 export async function getArtifact(actor: Actor, id: string) {
-  const [a] = await db.select().from(s.artifacts).where(eq(s.artifacts.id, id));
-  if (!a) throw new RelayError("not_found", "Artifact not found");
-  await assertMember(a.roomId, actor);
+  const wsId = await actorWorkspaceId(actor);
+  const a = await requireWorkspaceArtifact(wsId, id);
+  await assertMember(a.roomId, actor, wsId);
   const meta = { id: a.id, name: a.name, mime: a.mime, size: a.size, sha256: a.sha256, room_id: a.roomId, created_at: a.createdAt };
   if (a.size <= 100 * 1024 && isTextual(a.mime)) return { ...meta, content_text: a.content.toString("utf8") };
   return { ...meta, url: artifactUrl(a.id, true), note: "Too large or binary for inline; fetch url (valid 10 min)." };
@@ -1005,7 +1222,8 @@ export async function getArtifactSigned(id: string) {
   const [a] = await db.select().from(s.artifacts).where(eq(s.artifacts.id, id));
   return a ?? null;
 }
-export async function listArtifacts(roomId: string) {
+export async function listArtifacts(roomId: string, workspaceId?: string) {
+  if (workspaceId) await getRoom(roomId, db, workspaceId);
   const rows = await db
     .select({ id: s.artifacts.id, name: s.artifacts.name, mime: s.artifacts.mime, size: s.artifacts.size, sha256: s.artifacts.sha256, uploaderId: s.artifacts.uploaderId, createdAt: s.artifacts.createdAt })
     .from(s.artifacts)
@@ -1017,21 +1235,29 @@ export async function listArtifacts(roomId: string) {
 
 // ───────────────────────── human-in-the-loop ─────────────────────────
 export async function requestHumanInput(agent: AgentRow, i: { question: string; options?: string[]; roomId?: string; urgency?: string }) {
-  const roomId = i.roomId ?? GENERAL_ID;
+  const wsId = agent.workspaceId;
+  const roomId = i.roomId ?? (await generalRoomId(wsId));
   const id = newId("hreq");
   const options = (i.options ?? []).slice(0, 10);
   const sent = await sendMessage(
     { kind: "agent", id: agent.id, name: agent.name },
     { roomId, content: i.question, type: "human_request", metadata: { request_id: id, options, urgency: i.urgency ?? "normal" }, skipGuards: true },
+    wsId,
   );
   await db.insert(s.humanRequests).values({ id, roomId, agentId: agent.id, messageId: sent.message.id, question: i.question, optionsJson: options, urgency: i.urgency === "high" ? "high" : "normal" });
-  await publish("human_request.created", { request_id: id, room_id: roomId, agent: agent.name, question: i.question });
+  await publish("human_request.created", { request_id: id, room_id: roomId, agent: agent.name, question: i.question }, wsId);
   return { request_id: id, message_id: sent.message.id, note: "The answer will arrive in your inbox as a reply message (wait_for_message)." };
 }
 
-export async function listHumanRequests(status?: string) {
-  const rows = await db.select().from(s.humanRequests).where(status ? eq(s.humanRequests.status, status) : undefined).orderBy(desc(s.humanRequests.createdAt)).limit(200);
-  const agents = await db.select().from(s.agents);
+export async function listHumanRequests(status: string | undefined, workspaceId: string) {
+  const wsRooms = (await db.select({ id: s.rooms.id }).from(s.rooms).where(eq(s.rooms.workspaceId, workspaceId))).map((r) => r.id);
+  const rows = await db
+    .select()
+    .from(s.humanRequests)
+    .where(and(inArray(s.humanRequests.roomId, wsRooms.concat("none")), status ? eq(s.humanRequests.status, status) : undefined))
+    .orderBy(desc(s.humanRequests.createdAt))
+    .limit(200);
+  const agents = await db.select().from(s.agents).where(eq(s.agents.workspaceId, workspaceId));
   return rows.map((r) => ({
     id: r.id,
     room_id: r.roomId,
@@ -1048,52 +1274,80 @@ export async function listHumanRequests(status?: string) {
 }
 
 export async function answerHumanRequest(actor: Actor, id: string, answer: string) {
-  const [r] = await db.select().from(s.humanRequests).where(eq(s.humanRequests.id, id));
+  const wsId = await actorWorkspaceId(actor);
+  const wsRooms = (await db.select({ id: s.rooms.id }).from(s.rooms).where(eq(s.rooms.workspaceId, wsId))).map((r) => r.id);
+  const [r] = await db
+    .select()
+    .from(s.humanRequests)
+    .where(and(eq(s.humanRequests.id, id), inArray(s.humanRequests.roomId, wsRooms.concat("none"))));
   if (!r) throw new RelayError("not_found", "Request not found");
   if (r.status !== "open") throw new RelayError("conflict", "Request already answered", { status: 409 });
   await db.update(s.humanRequests).set({ status: "answered", answer, answeredBy: actor.id, answeredAt: new Date() }).where(eq(s.humanRequests.id, id));
-  await sendMessage(actor, { roomId: r.roomId, content: answer, type: "chat", replyTo: r.messageId, forceRecipients: [r.agentId], metadata: { request_id: id, answer, in_reply_to_request: r.question.slice(0, 200) }, priority: "urgent" });
-  await audit(actor, "human_request.answer", id);
-  await publish("human_request.answered", { request_id: id, room_id: r.roomId });
+  await sendMessage(actor, { roomId: r.roomId, content: answer, type: "chat", replyTo: r.messageId, forceRecipients: [r.agentId], metadata: { request_id: id, answer, in_reply_to_request: r.question.slice(0, 200) }, priority: "urgent" }, wsId);
+  await audit(actor, "human_request.answer", id, {}, wsId);
+  await publish("human_request.answered", { request_id: id, room_id: r.roomId }, wsId);
 }
 
 // ───────────────────────── logs / observability ─────────────────────────
-export async function logActivity(agentId: string, tool: string, status: string, durationMs: number, errorCode?: string, summary?: string) {
+export async function logActivity(agentId: string, tool: string, status: string, durationMs: number, errorCode?: string, summary?: string, workspaceId?: string) {
   await db.insert(s.toolActivity).values({ agentId, tool, status, durationMs, errorCode: errorCode ?? null, summary: summary ?? null }).catch(() => {});
-  if (tool !== "wait_for_message" || status !== "ok" || Math.random() < 0.1) await publish("activity.created", { agent_id: agentId, tool, status });
+  if (tool !== "wait_for_message" || status !== "ok" || Math.random() < 0.1) await publish("activity.created", { agent_id: agentId, tool, status }, workspaceId);
 }
 
-export async function listActivity(agentId?: string, limit = 100) {
-  const rows = await db.select().from(s.toolActivity).where(agentId ? eq(s.toolActivity.agentId, agentId) : undefined).orderBy(desc(s.toolActivity.id)).limit(Math.min(limit, 500));
-  const agents = await db.select().from(s.agents);
-  const st = await getSettings();
+export async function listActivity(agentId: string | undefined, limit: number, workspaceId: string) {
+  const agents = await db.select().from(s.agents).where(eq(s.agents.workspaceId, workspaceId));
+  if (agentId && !agents.some((a) => a.id === agentId)) throw new RelayError("not_found", "Agent not found");
+  const rows = await db
+    .select()
+    .from(s.toolActivity)
+    .where(agentId ? eq(s.toolActivity.agentId, agentId) : inArray(s.toolActivity.agentId, agents.map((a) => a.id).concat("none")))
+    .orderBy(desc(s.toolActivity.id))
+    .limit(Math.min(limit, 500));
+  const st = await getSettings(workspaceId);
   return rows.map((r) => ({ id: r.id, agent: agents.find((a) => a.id === r.agentId)?.name ?? r.agentId, tool: r.tool, status: r.status, duration_ms: r.durationMs, error_code: r.errorCode, summary: st.redactActivity ? null : r.summary, created_at: r.createdAt }));
 }
 
-export async function listAudit(limit = 200) {
-  return db.select().from(s.auditLogs).orderBy(desc(s.auditLogs.id)).limit(Math.min(limit, 500));
+/** Audit trail for one workspace. Rows written before per-user workspaces (workspace_id null) belong to ws_default. */
+export async function listAudit(limit: number, workspaceId: string) {
+  const inWs = workspaceId === WS_ID ? or(eq(s.auditLogs.workspaceId, workspaceId), isNull(s.auditLogs.workspaceId)) : eq(s.auditLogs.workspaceId, workspaceId);
+  return db.select().from(s.auditLogs).where(inWs).orderBy(desc(s.auditLogs.id)).limit(Math.min(limit, 500));
 }
 
-export async function listDeadLetters() {
+export async function listDeadLetters(workspaceId: string) {
+  const agents = await db.select().from(s.agents).where(eq(s.agents.workspaceId, workspaceId));
   const rows = await db
     .select({ item: s.inboxItems, msg: s.messages })
     .from(s.inboxItems)
     .innerJoin(s.messages, eq(s.messages.id, s.inboxItems.messageId))
-    .where(eq(s.inboxItems.state, "dead"))
+    .where(and(eq(s.inboxItems.state, "dead"), inArray(s.inboxItems.agentId, agents.map((a) => a.id).concat("none"))))
     .orderBy(desc(s.inboxItems.createdAt))
     .limit(200);
-  const agents = await db.select().from(s.agents);
   return rows.map((r) => ({ id: r.item.id, agent: agents.find((a) => a.id === r.item.agentId)?.name, message_id: r.msg.id, room_id: r.msg.roomId, content: r.msg.content.slice(0, 300), delivery_count: r.item.deliveryCount, created_at: r.item.createdAt }));
 }
+/** Dead-letter items are only addressable through agents of the caller's workspace. */
+async function requireWorkspaceInboxItem(workspaceId: string, id: string) {
+  const agents = await db.select({ id: s.agents.id }).from(s.agents).where(eq(s.agents.workspaceId, workspaceId));
+  const [item] = await db
+    .select()
+    .from(s.inboxItems)
+    .where(and(eq(s.inboxItems.id, id), inArray(s.inboxItems.agentId, agents.map((a) => a.id).concat("none"))));
+  if (!item) throw new RelayError("not_found", "Dead-letter item not found");
+  return item;
+}
+
 export async function requeueDead(actor: Actor, id: string) {
+  const wsId = await actorWorkspaceId(actor);
+  await requireWorkspaceInboxItem(wsId, id);
   const r = await db.update(s.inboxItems).set({ state: "pending", deliveryCount: 0, leaseExpiresAt: null }).where(and(eq(s.inboxItems.id, id), eq(s.inboxItems.state, "dead"))).returning();
   if (!r.length) throw new RelayError("not_found", "Dead-letter item not found");
   notifyAgent(r[0].agentId);
-  await audit(actor, "inbox.requeue", id);
+  await audit(actor, "inbox.requeue", id, {}, wsId);
 }
 export async function discardDead(actor: Actor, id: string) {
+  const wsId = await actorWorkspaceId(actor);
+  await requireWorkspaceInboxItem(wsId, id);
   await db.update(s.inboxItems).set({ state: "acked", ackedAt: new Date() }).where(and(eq(s.inboxItems.id, id), eq(s.inboxItems.state, "dead")));
-  await audit(actor, "inbox.discard", id);
+  await audit(actor, "inbox.discard", id, {}, wsId);
 }
 
 export async function metricsText() {
@@ -1124,7 +1378,7 @@ let lastRetention = 0;
 export async function maybeRetention() {
   if (Date.now() - lastRetention < 30 * 60_000) return;
   lastRetention = Date.now();
-  const st = await getSettings();
+  const st = await getSettings(); // retention defaults are global config; per-workspace settings may differ
   await db.delete(s.inboxItems).where(sql`${s.inboxItems.createdAt} < now() - (${st.retentionDaysInbox} * interval '1 day') and ${s.inboxItems.state} in ('acked','dead')`);
   await db.delete(s.toolActivity).where(sql`${s.toolActivity.createdAt} < now() - (${config.retentionDaysActivity} * interval '1 day')`);
   const old = await db.select({ id: s.messages.id }).from(s.messages).where(sql`${s.messages.createdAt} < now() - (${st.retentionDaysMessages} * interval '1 day')`).limit(1000);
