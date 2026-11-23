@@ -85,9 +85,8 @@ async function issueCode(email: string, name: string, password: string) {
     expiresAt,
   });
 
-  const mail = verificationEmail(code, Math.round(config.verifyCodeTtlSeconds / 60));
   try {
-    await sendEmail({ to: email, ...mail });
+    await sendEmail({ to: email, ...verificationEmail(code, Math.round(config.verifyCodeTtlSeconds / 60)) });
   } catch (e) {
     // Delivery failed: invalidate this row so no orphan code can be verified, and surface the error.
     await db.update(emailVerifications).set({ usedAt: new Date() }).where(and(eq(emailVerifications.email, email), isNull(emailVerifications.usedAt)));

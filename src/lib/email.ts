@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { config, log, RelayError } from "./config";
 
 const RESEND_ENDPOINT = "https://api.resend.com/emails";
@@ -73,46 +75,44 @@ function describeResendError(status: number, raw: string) {
   return "error";
 }
 
+export const VERIFICATION_EMAIL_TEMPLATE = "agentrelay-verification.html";
+
+// The email design is authored as plain HTML so it can be edited/previewed like any web page:
+// src/lib/email-templates/agentrelay-verification.html, with a single {{CODE}} placeholder that is
+// replaced at send time. Read from disk once per process (kept out of the bundle).
+let templateCache: string | null = null;
+function verificationHtml(): string {
+  if (templateCache === null) {
+    templateCache = readFileSync(join(process.cwd(), "src", "lib", "email-templates", VERIFICATION_EMAIL_TEMPLATE), "utf8");
+  }
+  return templateCache;
+}
+
+/** Fill {{CODE}} in the design. The code is only ever a 6-digit string, never user input. */
+export function renderVerificationEmail(template: string, code: string): string {
+  return template.split("{{CODE}}").join(code);
+}
+
 export function verificationEmail(code: string, minutes: number) {
   const safeCode = code.replace(/\D/g, "").slice(0, 6);
   const subject = "Kode verifikasi AgentRelay";
+  const html = renderVerificationEmail(verificationHtml(), safeCode);
+  // Plain-text alternative mirrors the design's wording for clients that block HTML.
   const text = [
-    "Your AgentRelay verification code is:",
+    "Kode verifikasi kamu",
+    "",
+    "Masukkan kode di bawah ini untuk menyelesaikan pendaftaran akun AgentRelay kamu.",
     "",
     `    ${safeCode}`,
     "",
-    `This code expires in ${minutes} minutes and can be used only once.`,
+    `Kode ini berlaku ${minutes} menit. Jangan bagikan ke siapa pun.`,
     "",
-    "If you did not request this code, you can safely ignore this email.",
+    "Kalau kamu tidak merasa mendaftar di AgentRelay, abaikan email ini. Tim AgentRelay tidak akan pernah meminta kode verifikasi kamu.",
     "",
-    "— AgentRelay",
+    "Email ini dikirim otomatis oleh AgentRelay",
+    "admin@helux.web.id",
+    "",
+    "AgentRelay — a workspace for AI agents",
   ].join("\n");
-  const html = `<!doctype html>
-<html>
-  <body style="margin:0;padding:0;background:#f4f1ea;font-family:Helvetica,Arial,sans-serif;color:#111">
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f1ea;padding:32px 16px">
-      <tr>
-        <td align="center">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#ffffff;border:1px solid #d8d2c4">
-            <tr>
-              <td style="padding:32px">
-                <p style="margin:0;font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:#ff4a1c">AgentRelay</p>
-                <h1 style="margin:12px 0 0;font-size:24px;line-height:1.2">Kode verifikasi Anda</h1>
-                <p style="margin:16px 0 0;font-size:15px;line-height:1.6;color:#444">Masukkan kode berikut untuk menyelesaikan pendaftaran akun AgentRelay Anda.</p>
-                <div style="margin:28px 0;padding:20px 0;border-top:1px solid #e6e1d6;border-bottom:1px solid #e6e1d6;text-align:center">
-                  <span style="font-family:'Courier New',monospace;font-size:40px;font-weight:700;letter-spacing:12px;color:#111">${safeCode}</span>
-                </div>
-                <p style="margin:0;font-size:14px;line-height:1.6;color:#444">Kode ini berlaku selama <strong>${minutes} menit</strong> dan hanya bisa dipakai sekali.</p>
-                <p style="margin:16px 0 0;font-size:13px;line-height:1.6;color:#777">Jika Anda tidak meminta kode ini, abaikan saja email ini — tidak ada akun yang dibuat.</p>
-                <p style="margin:24px 0 0;font-size:13px;color:#777">— AgentRelay</p>
-              </td>
-            </tr>
-          </table>
-          <p style="margin:16px 0 0;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#9a9488">Jangan bagikan kode ini kepada siapa pun.</p>
-        </td>
-      </tr>
-    </table>
-  </body>
-</html>`;
   return { subject, html, text };
 }
