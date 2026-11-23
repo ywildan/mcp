@@ -18,6 +18,8 @@ interface Shared {
   bus: EventEmitter;
   waiters: Map<string, Waiter>;
   rate: RateLimiter;
+  /** 1-hour sliding window used by email signup request/resend limits (5 per email and per IP). */
+  signupRate: RateLimiter;
   shuttingDown: boolean;
   shutdownHooked: boolean;
   lastPrune: number;
@@ -31,6 +33,7 @@ export const shared: Shared = (g.__agentRelay ??= {
   })(),
   waiters: new Map(),
   rate: new RateLimiter(),
+  signupRate: new RateLimiter(3600_000),
   shuttingDown: false,
   shutdownHooked: false,
   lastPrune: 0,

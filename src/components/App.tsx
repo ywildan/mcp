@@ -14,13 +14,114 @@ import { Dot, Logo, Mark } from "./site/ui";
 import { Activity, Requests, Settings, Tasks } from "./Pages";
 import { btnPrimary, field, Modal } from "./ui";
 
+type LoginMode = "signin" | "signup" | "verify";
+
 function Login({ needsSetup, onDone }: { needsSetup: boolean; onDone: (r: any) => void }) {
+  const [mode, setMode] = useState<LoginMode>("signin");
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [sentTo, setSentTo] = useState("");
+  const [notice, setNotice] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const [cooldown, setCooldown] = useState(0);
   const line = "mt-2 w-full border-b-2 border-ink bg-transparent py-2.5 text-[16px] outline-none transition-colors focus:border-signal";
+
+  // Resend countdown: restarts at 60s whenever a code is (re)sent.
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const t = setTimeout(() => setCooldown((c) => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [cooldown]);
+
+  const signingUp = !needsSetup && mode !== "signin";
+
+  const switchMode = (m: LoginMode) => {
+    setMode(m);
+    setErr("");
+    setNotice("");
+    setCode("");
+    if (m === "signup") setPassword("");
+  };
+
+  const submitSignin = async () => {
+    try {
+      onDone(await api("POST", needsSetup ? "auth/setup" : "auth/login", { email, password, name: name || undefined }));
+    } catch (er: any) {
+      setBusy(false);
+      if (er?.code === "needs_verification") {
+        // Offer to finish the signup: jump to the code screen and resend.
+        setSentTo(email.trim().toLowerCase());
+        setMode("verify");
+        setPassword("");
+        setCode("");
+        setErr("");
+        setNotice("Your email is not verified yet. We can send you a new code.");
+        try {
+          const r = await api("POST", "auth/signup/resend-code", { email: email.trim().toLowerCase() });
+          setNotice("A new verification code is on its way.");
+          setCooldown(r?.resend_after ?? 60);
+        } catch (e2: any) {
+          setErr(e2?.message ?? "Could not send a new code.");
+          if (e2?.retryAfter ?? e2?.status === 429) setCooldown(60);
+        }
+        return;
+      }
+      setErr(er.message);
+    }
+  };
+
+  const submitSignup = async () => {
+    try {
+      const r = await api("POST", "auth/signup/request-code", { email, name: name || undefined, password });
+      setSentTo(r.email ?? email.trim().toLowerCase());
+      setMode("verify");
+      setCode("");
+      setErr("");
+      setNotice("We sent a 6-digit code to your email. It expires in 10 minutes.");
+      setCooldown(r.resend_after ?? 60);
+      setPassword("");
+    } catch (er: any) {
+      setErr(er.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitVerify = async () => {
+    try {
+      onDone(await api("POST", "auth/signup/verify", { email: sentTo, code }));
+    } catch (er: any) {
+      setErr(er.message);
+      setBusy(false);
+    }
+  };
+
+  const resend = async () => {
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await api("POST", "auth/signup/resend-code", { email: sentTo });
+      setNotice("A new verification code is on its way.");
+      setCode("");
+      setCooldown(r?.resend_after ?? 60);
+    } catch (er: any) {
+      setErr(er.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const heading = needsSetup ? "Create your workspace" : mode === "signin" ? "Sign in to AgentRelay" : mode === "signup" ? "Create your account" : "Verify your email";
+  const blurb = needsSetup
+    ? "Set up the first administrator account to get your relay online."
+    : mode === "signin"
+      ? "Sign in to open your agent workspace and pick up where you left off."
+      : mode === "signup"
+        ? "Sign up with your email. We'll send a 6-digit code to confirm it before creating your account."
+        : `Enter the 6-digit code we sent to ${sentTo || "your email"}.`;
 
   return (
     <main className="grid min-h-screen bg-paper text-ink lg:grid-cols-[1.1fr_1fr]">
@@ -52,51 +153,116 @@ function Login({ needsSetup, onDone }: { needsSetup: boolean; onDone: (r: any) =
           <Link href="/" className="label mb-12 inline-flex items-center gap-2 text-mute hover:text-ink">
             <Icon name="arrow-right" size={14} className="rotate-180" /> Back to site
           </Link>
-          <p className="label text-signal">{needsSetup ? "First-time setup" : "Workspace"}</p>
-          <h1 className="font-display mt-3 text-5xl font-extrabold leading-[0.98]">{needsSetup ? "Create your workspace" : "Sign in to AgentRelay"}</h1>
-          <p className="mt-4 text-[15.5px] leading-relaxed text-ink-3">
-            {needsSetup ? "Set up the first administrator account to get your relay online." : "Sign in to open your agent workspace and pick up where you left off."}
-          </p>
+          <p className="label text-signal">{needsSetup ? "First-time setup" : mode === "signin" ? "Workspace" : "New account"}</p>
+          <h1 className="font-display mt-3 text-5xl font-extrabold leading-[0.98]">{heading}</h1>
+          <p className="mt-4 text-[15.5px] leading-relaxed text-ink-3">{blurb}</p>
 
-          <form
-            className="mt-10 space-y-5"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              setBusy(true);
-              setErr("");
-              try {
-                onDone(await api("POST", needsSetup ? "auth/setup" : "auth/login", { email, password, name: name || undefined }));
-              } catch (er: any) {
-                setErr(er.message);
-                setBusy(false);
-              }
-            }}
-          >
-            <label className="block">
-              <span className="label text-mute">Email</span>
-              <input className={line} type="email" autoComplete="username" aria-label="Email" required value={email} onChange={(e) => setEmail(e.target.value)} />
-            </label>
-            {needsSetup && (
+          {mode === "verify" && !needsSetup ? (
+            <form
+              className="mt-10 space-y-5"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setBusy(true);
+                setErr("");
+                await submitVerify();
+              }}
+            >
               <label className="block">
-                <span className="label text-mute">Name</span>
-                <input className={line} autoComplete="name" aria-label="Name" value={name} onChange={(e) => setName(e.target.value)} />
+                <span className="label text-mute">Verification code</span>
+                <input
+                  className={`${line} font-mono tracking-[0.5em]`}
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  aria-label="Verification code"
+                  placeholder="000000"
+                  maxLength={6}
+                  pattern="[0-9]{6}"
+                  required
+                  autoFocus
+                  value={code}
+                  onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                />
               </label>
-            )}
-            <label className="block">
-              <span className="label text-mute">Password {needsSetup && "(at least 8 characters)"}</span>
-              <input className={line} type="password" autoComplete={needsSetup ? "new-password" : "current-password"} aria-label="Password" minLength={needsSetup ? 8 : 1} required value={password} onChange={(e) => setPassword(e.target.value)} />
-            </label>
-            {err && <p role="alert" className="border border-signal-dark bg-signal/10 px-3 py-2.5 text-[13px] text-signal-dark">{err}</p>}
-            <button disabled={busy} className="group relative mt-4 flex w-full items-center justify-between overflow-hidden bg-ink px-5 py-4 text-[15px] font-semibold text-paper transition-colors hover:bg-signal hover:text-ink disabled:opacity-70">
-              <motion.span className="absolute inset-y-0 left-0 bg-signal" initial={{ width: 0 }} animate={{ width: busy ? "100%" : 0 }} transition={{ duration: 0.7, ease: "easeInOut" }} />
-              <span className="relative">{busy ? "Please wait…" : needsSetup ? "Create admin and sign in" : "Sign in"}</span>
-              <Icon name="arrow-right" size={18} className="relative transition-transform group-hover:translate-x-1" />
-            </button>
-          </form>
+              {notice && !err && <p className="border border-ink/20 bg-ink/[0.04] px-3 py-2.5 text-[13px] text-ink-3" role="status">{notice}</p>}
+              {err && <p role="alert" className="border border-signal-dark bg-signal/10 px-3 py-2.5 text-[13px] text-signal-dark">{err}</p>}
+              <button disabled={busy} className="group relative mt-4 flex w-full items-center justify-between overflow-hidden bg-ink px-5 py-4 text-[15px] font-semibold text-paper transition-colors hover:bg-signal hover:text-ink disabled:opacity-70">
+                <motion.span className="absolute inset-y-0 left-0 bg-signal" initial={{ width: 0 }} animate={{ width: busy ? "100%" : 0 }} transition={{ duration: 0.7, ease: "easeInOut" }} />
+                <span className="relative">{busy ? "Please wait…" : "Verify and create account"}</span>
+                <Icon name="arrow-right" size={18} className="relative transition-transform group-hover:translate-x-1" />
+              </button>
+              <div className="flex items-center justify-between gap-4 pt-1 text-[13px]">
+                <button type="button" onClick={resend} disabled={busy || cooldown > 0} className="text-ink underline decoration-ink/30 underline-offset-4 transition-colors hover:text-signal disabled:text-mute disabled:no-underline disabled:opacity-70">
+                  {cooldown > 0 ? `Resend code in ${cooldown}s` : "Resend code"}
+                </button>
+                <button type="button" onClick={() => switchMode("signup")} className="text-mute transition-colors hover:text-ink">
+                  Change email
+                </button>
+              </div>
+            </form>
+          ) : (
+            <form
+              className="mt-10 space-y-5"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setBusy(true);
+                setErr("");
+                setNotice("");
+                if (signingUp) await submitSignup();
+                else await submitSignin();
+              }}
+            >
+              <label className="block">
+                <span className="label text-mute">Email</span>
+                <input className={line} type="email" autoComplete="username" aria-label="Email" required value={email} onChange={(e) => setEmail(e.target.value)} />
+              </label>
+              {(needsSetup || signingUp) && (
+                <label className="block">
+                  <span className="label text-mute">Name</span>
+                  <input className={line} autoComplete="name" aria-label="Name" value={name} onChange={(e) => setName(e.target.value)} />
+                </label>
+              )}
+              <label className="block">
+                <span className="label text-mute">Password {needsSetup || signingUp ? "(at least 8 characters)" : ""}</span>
+                <input
+                  className={line}
+                  type="password"
+                  autoComplete={needsSetup || signingUp ? "new-password" : "current-password"}
+                  aria-label="Password"
+                  minLength={needsSetup || signingUp ? 8 : 1}
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+              </label>
+              {err && <p role="alert" className="border border-signal-dark bg-signal/10 px-3 py-2.5 text-[13px] text-signal-dark">{err}</p>}
+              <button disabled={busy} className="group relative mt-4 flex w-full items-center justify-between overflow-hidden bg-ink px-5 py-4 text-[15px] font-semibold text-paper transition-colors hover:bg-signal hover:text-ink disabled:opacity-70">
+                <motion.span className="absolute inset-y-0 left-0 bg-signal" initial={{ width: 0 }} animate={{ width: busy ? "100%" : 0 }} transition={{ duration: 0.7, ease: "easeInOut" }} />
+                <span className="relative">{busy ? "Please wait…" : needsSetup ? "Create admin and sign in" : signingUp ? "Send verification code" : "Sign in"}</span>
+                <Icon name="arrow-right" size={18} className="relative transition-transform group-hover:translate-x-1" />
+              </button>
+              {!needsSetup && (
+                <p className="pt-1 text-[13px] text-mute">
+                  {signingUp ? (
+                    <>Already have an account?{" "}
+                      <button type="button" onClick={() => switchMode("signin")} className="text-ink underline decoration-ink/30 underline-offset-4 transition-colors hover:text-signal">Sign in</button>
+                    </>
+                  ) : (
+                    <>Don&apos;t have an account?{" "}
+                      <button type="button" onClick={() => switchMode("signup")} className="text-ink underline decoration-ink/30 underline-offset-4 transition-colors hover:text-signal">Sign up</button>
+                    </>
+                  )}
+                </p>
+              )}
+            </form>
+          )}
 
           <p className="mt-8 flex items-start gap-3 border-t border-ink/20 pt-6 text-[13px] leading-relaxed text-mute">
             <Icon name="lock" size={16} className="mt-0.5 shrink-0" />
-            {needsSetup ? "No default credentials are created. This first account will have administrator access." : "There are no default credentials. The first admin comes from ADMIN_EMAIL / ADMIN_PASSWORD or a one-time setup form. Sessions use secure, same-site cookies with CSRF protection."}
+            {needsSetup
+              ? "No default credentials are created. This first account will have administrator access."
+              : mode === "verify"
+                ? "Codes are single-use, expire after 10 minutes and are stored only as a hash. Never share your code with anyone."
+                : "There are no default credentials. The first admin comes from ADMIN_EMAIL / ADMIN_PASSWORD or a one-time setup form. Sessions use secure, same-site cookies with CSRF protection."}
           </p>
         </div>
       </section>

@@ -30,6 +30,14 @@ export const config = {
   maxContentBytes: 32 * 1024,
   maxMetadataBytes: 16 * 1024,
   logLevel: process.env.LOG_LEVEL ?? "info",
+  // Resend transactional email (email signup verification). Required — no default; the signup flow reports a
+  // clear error if it is missing rather than silently dropping codes.
+  resendApiKey: process.env.RESEND_API_KEY ?? "",
+  emailFrom: process.env.EMAIL_FROM ?? "AgentRelay <admin@helux.web.id>",
+  verifyCodeTtlSeconds: num("VERIFY_CODE_TTL_SECONDS", 600),
+  verifyCodeMaxAttempts: num("VERIFY_CODE_MAX_ATTEMPTS", 5),
+  verifyResendCooldownSeconds: num("VERIFY_RESEND_COOLDOWN_SECONDS", 60),
+  verifyRequestsPerHour: num("VERIFY_REQUESTS_PER_HOUR", 5),
 };
 
 export const newId = (prefix: string) => `${prefix}_${randomUUID().replace(/-/g, "").slice(0, 24)}`;

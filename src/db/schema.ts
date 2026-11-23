@@ -35,7 +35,25 @@ export const users = pgTable("users", {
   passwordHash: text("password_hash").notNull(),
   role: text("role").notNull().default("member"), // admin | member
   createdAt: ts("created_at").notNull().defaultNow(),
+  emailVerifiedAt: ts("email_verified_at"), // null = email not verified yet (cannot log in)
 });
+
+// Pending email signups. Only the sha256 of the 6-digit code is stored; the plain code lives solely in the email.
+export const emailVerifications = pgTable(
+  "email_verifications",
+  {
+    id: text("id").primaryKey(),
+    email: text("email").notNull(),
+    codeHash: text("code_hash").notNull(), // sha256 of the 6-digit code; the plain code is never stored
+    name: text("name").notNull().default(""),
+    passwordHash: text("password_hash").notNull().default(""),
+    expiresAt: ts("expires_at").notNull(),
+    attempts: integer("attempts").notNull().default(0),
+    usedAt: ts("used_at"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [index("email_verifications_email_idx").on(t.email)],
+);
 
 export const userSessions = pgTable("user_sessions", {
   id: text("id").primaryKey(), // sha256 of cookie value

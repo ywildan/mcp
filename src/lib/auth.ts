@@ -24,6 +24,14 @@ export function checkLoginRate(req: Request, email: string) {
   if (wait) throw new RelayError("rate_limited", "Too many login attempts", { retry_after: wait });
 }
 
+/** Email signup: 5 code requests per hour, per email AND per IP (same limiter pattern as login). */
+export function checkSignupRate(req: Request, email: string) {
+  const a = shared.signupRate.hit(`signup:email:${email.toLowerCase()}`, config.verifyRequestsPerHour);
+  const b = shared.signupRate.hit(`signup:ip:${clientIp(req)}`, config.verifyRequestsPerHour);
+  const wait = Math.max(a, b);
+  if (wait) throw new RelayError("rate_limited", "Too many verification code requests. Please try again later.", { retry_after: wait });
+}
+
 export async function createSession(userId: string) {
   const raw = randomToken(32);
   const csrf = randomToken(24);
