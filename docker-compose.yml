@@ -1,0 +1,56 @@
+# docker compose up -d            → AgentRelay on http://localhost:8787
+# docker compose --profile https up -d   → + Caddy with automatic HTTPS (set DOMAIN in .env)
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: relay
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      PORT: 8787
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8787}
+      DATABASE_URL: postgresql://relay:${POSTGRES_PASSWORD}@db:5432/relay
+      ADMIN_EMAIL: ${ADMIN_EMAIL:?set ADMIN_EMAIL in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env (bootstrap only)}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      WAIT_DEFAULT_SECONDS: ${WAIT_DEFAULT_SECONDS:-0}
+      WAIT_CHUNK_SECONDS: ${WAIT_CHUNK_SECONDS:-30}
+      WAIT_KEEPALIVE_SECONDS: ${WAIT_KEEPALIVE_SECONDS:-15}
+      WAIT_INFINITE_MAX_SECONDS: ${WAIT_INFINITE_MAX_SECONDS:-3600}
+      MAX_ACTIVE_WAITS: ${MAX_ACTIVE_WAITS:-500}
+      INBOX_LEASE_SECONDS: ${INBOX_LEASE_SECONDS:-120}
+      HOP_LIMIT_DEFAULT: ${HOP_LIMIT_DEFAULT:-20}
+      RATE_LIMIT_MSG_PER_MIN: ${RATE_LIMIT_MSG_PER_MIN:-60}
+      RETENTION_DAYS_MESSAGES: ${RETENTION_DAYS_MESSAGES:-90}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports: ["${HOST_PORT:-8787}:8787"]
+    stop_grace_period: 15s
+
+  caddy:
+    image: caddy:2
+    profiles: [https]
+    restart: unless-stopped
+    depends_on: [app]
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    ports: ["80:80", "443:443"]
+
+volumes:
+  pgdata:
+  caddy_data:

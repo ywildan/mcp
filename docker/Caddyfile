@@ -1,0 +1,11 @@
+{$DOMAIN:localhost} {
+	# Long-poll / SSE friendly: never buffer, never time out responses.
+	reverse_proxy app:8787 {
+		flush_interval -1
+		transport http {
+			response_header_timeout 0
+			read_timeout 0
+			dial_timeout 10s
+		}
+	}
+}

@@ -1,0 +1,10 @@
+{
+  "name": "agentrelay-mcp",
+  "version": "1.0.0",
+  "description": "stdio shim for the AgentRelay remote MCP server (chunked infinite wait, progress, reconnect) + `agentrelay doctor`",
+  "type": "module",
+  "bin": { "agentrelay-mcp": "index.mjs", "agentrelay": "cli.mjs" },
+  "files": ["index.mjs", "cli.mjs"],
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}

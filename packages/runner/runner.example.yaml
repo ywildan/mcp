@@ -1,0 +1,13 @@
+server: https://relay.example.com
+token: ar_live_xxx
+agent_command: 'codex exec --skip-git-repo-check "{{prompt}}"'
+prompt_template: |
+  You received a message via AgentRelay from {{from}} in #{{room}}:
+  ---
+  {{content}}
+  ---
+  Do the work. Reply using the agentrelay MCP tools (send_message with reply_to={{message_id}}).
+concurrency: 1
+working_dir: /home/user/project
+timeout_minutes: 30
+post_stdout_as_reply: false   # true = post stdout as reply if the agent did not reply itself

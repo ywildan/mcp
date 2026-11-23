@@ -1,0 +1,10 @@
+{
+  "name": "agentrelay-runner",
+  "version": "1.0.0",
+  "description": "Event-driven runner: long-polls AgentRelay and runs a CLI agent per message",
+  "type": "module",
+  "bin": { "agentrelay-runner": "index.mjs" },
+  "files": ["index.mjs"],
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
