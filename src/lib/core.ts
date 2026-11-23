@@ -79,12 +79,14 @@ export function ensureWorkspace(): Promise<void> {
       .insert(s.rooms)
       .values({ id: GENERAL_ID, workspaceId: WS_ID, name: "general", topic: "Default room for everyone", hopLimit: config.hopLimitDefault })
       .onConflictDoNothing();
+    await backfillEmailVerification();
     const email = process.env.ADMIN_EMAIL;
     const pw = process.env.ADMIN_PASSWORD;
     if (email && pw) {
       const [{ n }] = await db.select({ n: sql<number>`count(*)::int` }).from(s.users);
       if (n === 0) {
-        await createUser({ kind: "user", id: "system", name: "bootstrap" }, { email, name: email.split("@")[0], password: pw, role: "admin" }).catch((e) =>
+        // Bootstrap admin comes from trusted env config, so its email is considered verified.
+        await createUser({ kind: "user", id: "system", name: "bootstrap" }, { email, name: email.split("@")[0], password: pw, role: "admin", emailVerifiedAt: new Date() }).catch((e) =>
           log("warn", "bootstrap_admin_failed", { err: String(e) }),
         );
       }
@@ -95,6 +97,22 @@ export function ensureWorkspace(): Promise<void> {
   }));
 }
 
+/**
+ * One-time upgrade step for the email-verification feature: accounts that already existed before the
+ * feature shipped are trusted as verified so deploying it never locks out current users. A marker in the
+ * workspace settings makes this run exactly once; accounts created afterwards start unverified.
+ */
+async function backfillEmailVerification() {
+  const [ws] = await db.select().from(s.workspaces).where(eq(s.workspaces.id, WS_ID));
+  const settings = (ws?.settingsJson ?? {}) as Record<string, unknown>;
+  if (settings.emailVerificationBackfilled) return;
+  await db.update(s.users).set({ emailVerifiedAt: new Date() }).where(isNull(s.users.emailVerifiedAt));
+  await db
+    .update(s.workspaces)
+    .set({ settingsJson: { ...settings, emailVerificationBackfilled: true } })
+    .where(eq(s.workspaces.id, WS_ID));
+}
+
 export async function audit(actor: { kind: string; id: string }, action: string, target = "", detail: Record<string, unknown> = {}) {
   await db.insert(s.auditLogs).values({ actorKind: actor.kind, actorId: actor.id, action, target, detailJson: detail });
 }
@@ -102,14 +120,18 @@ export async function audit(actor: { kind: string; id: string }, action: string,
 // ───────────────────────── users ─────────────────────────
 export const userHandle = (u: { email: string }) => u.email.split("@")[0].toLowerCase().replace(/[^a-z0-9_-]/g, "-");
 
-export async function createUser(actor: Actor, i: { email: string; name: string; password: string; role: "admin" | "member" }) {
+export async function createUser(
+  actor: Actor,
+  i: { email: string; name: string; password?: string; passwordHash?: string; role: "admin" | "member"; emailVerifiedAt?: Date | null },
+) {
   const { hashPassword } = await import("./auth");
-  if (i.password.length < 8) throw new RelayError("invalid_input", "Password must be at least 8 characters");
+  // passwordHash lets the email-signup flow pass an already-hashed password (the plain one is never stored).
+  if (!i.passwordHash && (i.password ?? "").length < 8) throw new RelayError("invalid_input", "Password must be at least 8 characters");
   const email = i.email.trim().toLowerCase();
   const [dupe] = await db.select().from(s.users).where(eq(s.users.email, email));
   if (dupe) throw new RelayError("conflict", "Email already registered", { status: 409 });
   const id = newId("usr");
-  await db.insert(s.users).values({ id, workspaceId: WS_ID, email, name: i.name || email.split("@")[0], passwordHash: await hashPassword(i.password), role: i.role });
+  await db.insert(s.users).values({ id, workspaceId: WS_ID, email, name: i.name || email.split("@")[0], passwordHash: i.passwordHash ?? (await hashPassword(i.password!)), role: i.role, emailVerifiedAt: i.emailVerifiedAt ?? null });
   await db.insert(s.roomMembers).values({ roomId: GENERAL_ID, participantKind: "user", participantId: id, notifyMode: "all" }).onConflictDoNothing();
   await audit(actor, "user.create", id, { email, role: i.role });
   return { id, email, name: i.name, role: i.role };

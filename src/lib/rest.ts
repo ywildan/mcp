@@ -7,6 +7,7 @@ import * as core from "@/lib/core";
 import { RelayError, log } from "@/lib/config";
 import { checkLoginRate, createSession, destroySession, getSessionUser, requireUser, sessionCookie, verifyPassword, type SessionUser } from "@/lib/auth";
 import { interruptWaiter } from "@/lib/events";
+import { consumeSignupCode, requestSignupCode, resendSignupCode } from "@/lib/signup";
 
 interface Ctx {
   req: Request;
@@ -30,7 +31,7 @@ const pid = (v: string) => {
   if ((kind !== "agent" && kind !== "user") || !rest.length) throw new RelayError("invalid_input", "participant id must be agent:<id> or user:<id>");
   return { kind: kind as "agent" | "user", id: rest.join(":") };
 };
-const userView = (u: typeof users.$inferSelect) => ({ id: u.id, email: u.email, name: u.name, role: u.role, handle: core.userHandle(u), created_at: u.createdAt });
+const userView = (u: typeof users.$inferSelect) => ({ id: u.id, email: u.email, name: u.name, role: u.role, handle: core.userHandle(u), created_at: u.createdAt, email_verified_at: u.emailVerifiedAt });
 const ok = { ok: true };
 
 // ── auth ──
@@ -46,7 +47,8 @@ add("POST", "auth/setup", "public", async ({ req, body }) => {
   const [{ n }] = await db.select({ n: count() }).from(users);
   if (n > 0) throw new RelayError("forbidden", "Setup already completed", { status: 403 });
   const b = parse(credSchema.extend({ name: z.string().max(100).optional(), password: z.string().min(8).max(200) }), body);
-  const u = await core.createUser({ kind: "user", id: "system", name: "setup" }, { email: b.email, name: b.name ?? b.email.split("@")[0], password: b.password, role: "admin" });
+  // The one-time setup form is only reachable while there are no users; its email counts as verified.
+  const u = await core.createUser({ kind: "user", id: "system", name: "setup" }, { email: b.email, name: b.name ?? b.email.split("@")[0], password: b.password, role: "admin", emailVerifiedAt: new Date() });
   const sess = await createSession(u.id);
   return { __cookie: sessionCookie(req, sess.raw), user: u, csrf: sess.csrf };
 });
@@ -59,10 +61,58 @@ add("POST", "auth/login", "public", async ({ req, body }) => {
     await core.audit({ kind: "system", id: "login" }, "login.failed", b.email.slice(0, 100));
     throw new RelayError("unauthorized", "Invalid email or password");
   }
+  // Credentials are correct but the email was never confirmed: let the UI offer "resend code".
+  if (!u.emailVerifiedAt) {
+    await core.audit({ kind: "system", id: "login" }, "login.unverified", u.email);
+    throw new RelayError("needs_verification", "This account has not verified its email yet. Request a new verification code.", { status: 403, email: u.email });
+  }
   const sess = await createSession(u.id);
   await core.audit({ kind: "user", id: u.id }, "login.success", u.email);
   return { __cookie: sessionCookie(req, sess.raw), user: userView(u), csrf: sess.csrf };
 });
+// ── email signup (public, two-step: request code → verify) ──
+const signupSchema = z.object({
+  email: z.string().email().max(200),
+  name: z.string().max(100).optional(),
+  password: z.string().min(8, "Password must be at least 8 characters").max(200),
+});
+add("POST", "auth/signup/request-code", "public", async ({ req, body }) => {
+  await core.ensureWorkspace();
+  const b = parse(signupSchema, body ?? {});
+  return requestSignupCode(req, { email: b.email, name: b.name ?? "", password: b.password });
+});
+add("POST", "auth/signup/verify", "public", async ({ req, body }) => {
+  await core.ensureWorkspace();
+  const b = parse(z.object({ email: z.string().email().max(200), code: z.string().min(1).max(12) }), body ?? {});
+  const pending = await consumeSignupCode(b.email, b.code);
+  let u: typeof users.$inferSelect;
+  const [existing] = await db.select().from(users).where(eq(users.email, pending.email));
+  if (existing) {
+    // Legacy account created before verification existed: confirm it instead of duplicating.
+    if (existing.emailVerifiedAt) throw new RelayError("conflict", "Email already registered", { status: 409 });
+    const [updated] = await db.update(users).set({ emailVerifiedAt: new Date() }).where(eq(users.id, existing.id)).returning();
+    u = updated;
+    await core.audit({ kind: "user", id: u.id }, "signup.verified", u.email);
+  } else {
+    const created = await core.createUser({ kind: "user", id: "signup", name: "signup" }, {
+      email: pending.email,
+      name: pending.name,
+      passwordHash: pending.passwordHash,
+      role: "member",
+      emailVerifiedAt: new Date(),
+    });
+    [u] = await db.select().from(users).where(eq(users.id, created.id));
+    await core.audit({ kind: "user", id: u.id }, "signup.created", u.email);
+  }
+  const sess = await createSession(u.id);
+  return { __cookie: sessionCookie(req, sess.raw), needs_setup: false, user: userView(u), csrf: sess.csrf };
+});
+add("POST", "auth/signup/resend-code", "public", async ({ req, body }) => {
+  await core.ensureWorkspace();
+  const b = parse(z.object({ email: z.string().email().max(200) }), body ?? {});
+  return resendSignupCode(req, b.email);
+});
+
 add("POST", "auth/logout", "user", async ({ req, su }) => {
   await destroySession(su.sessionId);
   return { __cookie: sessionCookie(req, "", 0), ...ok };
