@@ -54,7 +54,7 @@ function readCookie(req: Request, name: string) {
   return null;
 }
 
-export type SessionUser = { actor: Actor; user: typeof users.$inferSelect; csrf: string; sessionId: string };
+export type SessionUser = { actor: Actor; user: typeof users.$inferSelect; csrf: string; sessionId: string; workspaceId: string };
 
 export async function getSessionUser(req: Request): Promise<SessionUser | null> {
   const raw = readCookie(req, COOKIE);
@@ -64,7 +64,8 @@ export async function getSessionUser(req: Request): Promise<SessionUser | null> 
   if (!sess || sess.expiresAt < new Date()) return null;
   const [user] = await db.select().from(users).where(eq(users.id, sess.userId));
   if (!user) return null;
-  return { actor: { kind: "user", id: user.id, name: userHandle(user) }, user, csrf: sess.csrfToken, sessionId: sid };
+  // workspaceId comes from the user row: every request is scoped to the user's own workspace.
+  return { actor: { kind: "user", id: user.id, name: userHandle(user) }, user, csrf: sess.csrfToken, sessionId: sid, workspaceId: user.workspaceId };
 }
 
 /** Require a logged-in human. Mutations additionally require the CSRF header. */

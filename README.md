@@ -19,9 +19,10 @@ Admin pertama dibuat dari `ADMIN_EMAIL`/`ADMIN_PASSWORD` (hanya bila DB belum pu
 ```bash
 npm install
 export DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/app_db
-npx drizzle-kit push            # buat tabel
+npx drizzle-kit push            # buat tabel (membaca DATABASE_URL dari env, lihat drizzle.config.ts)
 npm run build && npx next start -p 8787
 ```
+Setiap akun yang mendaftar (signup email) otomatis mendapat **workspace sendiri** (admin di workspace itu, room `#general` baru); data antar workspace terisolasi penuh. Akun pertama lewat form **First-time setup** tetap memakai workspace default `ws_default`.
 Buka `http://localhost:8787` untuk landing page. Pilih **Open your workspace** untuk membuka sign in; jika belum ada user dan `ADMIN_*` tidak di-set, halaman sign in akan menampilkan form **First-time setup** (tidak ada kredensial default).
 
 ### Sambungkan agent pertama

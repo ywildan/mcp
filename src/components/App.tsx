@@ -299,7 +299,7 @@ function debounced(fn: () => void, ms = 250) {
 
 export default function App({ signInPage = false, workspaceRoute = false }: { signInPage?: boolean; workspaceRoute?: boolean }) {
   const router = useRouter();
-  const [boot, setBoot] = useState<{ me: any; needs_setup: boolean } | null>(null);
+  const [boot, setBoot] = useState<{ me: any; needs_setup: boolean; workspace?: { id: string; name: string } | null } | null>(null);
   const [agents, setAgents] = useState<any[]>([]);
   const [rooms, setRooms] = useState<any[]>([]);
   const [requests, setRequests] = useState<any[]>([]);
@@ -325,7 +325,7 @@ export default function App({ signInPage = false, workspaceRoute = false }: { si
   const loadMe = useCallback(async () => {
     const r = await api("GET", "auth/me");
     if (r.csrf) setCsrf(r.csrf);
-    setBoot({ me: r.user, needs_setup: r.needs_setup });
+    setBoot({ me: r.user, needs_setup: r.needs_setup, workspace: r.workspace ?? null });
     if (r.user && signInPage) router.replace("/workspace");
   }, [router, signInPage]);
 
@@ -420,9 +420,14 @@ export default function App({ signInPage = false, workspaceRoute = false }: { si
     return (
       <Login
         needsSetup={boot.needs_setup}
-        onDone={(r) => {
+        onDone={async (r) => {
           setCsrf(r.csrf);
-          setBoot({ me: r.user.handle ? r.user : { ...r.user, handle: r.user.email.split("@")[0] }, needs_setup: false });
+          const me = r.user.handle ? r.user : { ...r.user, handle: r.user.email.split("@")[0] };
+          setBoot({ me, needs_setup: false, workspace: null });
+          // Fetch the freshly created workspace name (login/setup responses do not include it).
+          api("GET", "auth/me")
+            .then((m) => setBoot({ me: m.user ?? me, needs_setup: false, workspace: m.workspace ?? null }))
+            .catch(() => {});
           router.replace("/workspace");
         }}
       />
@@ -495,7 +500,14 @@ export default function App({ signInPage = false, workspaceRoute = false }: { si
               </button>
               <div>
                 <p className="label text-mute">AgentRelay workspace</p>
-                <h1 className="font-display mt-0.5 text-xl font-bold leading-none">{pageTitle}</h1>
+                <h1 className="font-display mt-0.5 flex items-baseline gap-2 text-xl font-bold leading-none">
+                  <span>{pageTitle}</span>
+                  {boot?.workspace?.name && (
+                    <span className="border border-ink/25 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-mute dark:border-paper/25" title="Your workspace">
+                      {boot.workspace.name}
+                    </span>
+                  )}
+                </h1>
               </div>
             </div>
             <div className="flex items-center gap-4">
