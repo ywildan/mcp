@@ -442,13 +442,13 @@ export default function App({ signInPage = false, workspaceRoute = false }: { si
     <AppCtx.Provider value={ctx}>
       <div className="flex h-screen overflow-hidden bg-paper text-slate-900 dark:bg-slate-950 dark:text-slate-100">
         {menu && <button className="fixed inset-0 z-30 cursor-default bg-slate-950/50 md:hidden" onClick={() => setMenu(false)} aria-label="Close navigation" />}
-        <aside className={`fixed inset-y-0 left-0 z-40 flex w-[264px] shrink-0 flex-col border-r border-white/[0.07] bg-ink text-slate-300 shadow-2xl shadow-black/10 transition-transform md:static md:translate-x-0 md:shadow-none ${menu ? "translate-x-0" : "-translate-x-full"}`} aria-label="Sidebar">
-          <div className="flex h-[76px] items-center justify-between border-b border-paper/15 px-5">
+        <aside className={`fixed inset-y-0 left-0 z-40 flex w-[264px] shrink-0 flex-col overflow-hidden border-r border-white/[0.07] bg-ink text-slate-300 shadow-2xl shadow-black/10 transition-transform md:static md:translate-x-0 md:shadow-none ${menu ? "translate-x-0" : "-translate-x-full"}`} aria-label="Sidebar">
+          <div className="flex h-[76px] shrink-0 items-center justify-between border-b border-paper/15 px-5">
             <Link href="/" className="flex min-w-0 items-center" aria-label="AgentRelay site"><Logo dark={false} /></Link>
             <span title={`Realtime: ${sse}`} aria-label={`Realtime ${sse}`} className="shrink-0"><Dot state={sse === "live" ? "online" : sse === "connecting" ? "blocked" : "error"} /></span>
           </div>
-          <div className="px-4 pb-2 pt-3 text-[9px] font-semibold uppercase tracking-[0.18em] text-slate-600">Workspace</div>
-          <nav className="space-y-1 px-3" aria-label="Main">
+          <div className="shrink-0 px-4 pb-2 pt-3 text-[9px] font-semibold uppercase tracking-[0.18em] text-slate-600">Workspace</div>
+          <nav className="shrink-0 space-y-1 px-3" aria-label="Main">
             {NAV.map(({ id, icon, label }) => (
               <button key={id} onClick={() => (setNav(id), setMenu(false))} aria-current={nav === id} className={`group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-[13px] transition ${nav === id ? "bg-paper/10 font-semibold text-paper shadow-[inset_3px_0_0_#ff4a1c]" : "text-slate-400 hover:bg-white/[0.045] hover:text-slate-100"}`}>
                 <Icon name={icon} size={17} className={nav === id ? "text-signal" : "text-slate-500 group-hover:text-slate-300"} />
@@ -457,8 +457,8 @@ export default function App({ signInPage = false, workspaceRoute = false }: { si
               </button>
             ))}
           </nav>
-          <div className="mx-4 mt-5 border-t border-white/[0.06]" />
-          <div className="mt-4 flex items-center justify-between px-5 pb-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-600">
+          <div className="mx-4 mt-5 shrink-0 border-t border-white/[0.06]" />
+          <div className="mt-4 flex shrink-0 items-center justify-between px-5 pb-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-600">
             <span>Rooms</span>
             <button className="flex h-6 w-6 items-center justify-center rounded-md text-slate-500 transition hover:bg-white/[0.07] hover:text-white" onClick={() => setNewRoom(true)} title="New room" aria-label="New room">
               <Icon name="plus" size={15} />
@@ -470,7 +470,7 @@ export default function App({ signInPage = false, workspaceRoute = false }: { si
             {dms.map((r) => <RoomButton key={r.id} r={r} label={`@ ${roomLabel(r)}`} active={nav === "chat" && active === r.id} unread={unread[r.id]} onClick={() => openRoom(r.id)} />)}
             {!groups.length && !dms.length && <p className="px-3 py-2 text-[11px] leading-5 text-slate-600">Create a room to give your agents a shared place to work.</p>}
           </div>
-          <div className="border-t border-white/[0.07] p-3">
+          <div className="shrink-0 border-t border-white/[0.07] p-3">
             <div className="flex items-center gap-2.5 rounded-xl p-2">
               <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-slate-700/70 text-xs font-semibold text-slate-200">{(me.name || me.email || "U").slice(0, 1).toUpperCase()}</div>
               <div className="min-w-0 flex-1 truncate">
@@ -519,10 +519,13 @@ export default function App({ signInPage = false, workspaceRoute = false }: { si
             </div>
           </header>
           
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          {/* Chat manages its own scrolling (message list only), so the outer
+              wrapper must not scroll or the room header would scroll away.
+              Other pages keep scrolling here. */}
+          <div className={nav === "chat" ? "min-h-0 flex-1 overflow-hidden" : "min-h-0 flex-1 overflow-y-auto"}>
             <AnimatePresence mode="wait" initial={false}>
-              <motion.div key={nav} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.16 }} className="h-full">
-                {nav === "chat" && (active ? <div className="h-full"><Chat key={active} roomId={active} /></div> : <div className="p-8 text-sm text-slate-500">{rooms.length ? "Select a room." : "No rooms yet — create one with the + button in the sidebar."}</div>)}
+              <motion.div key={nav} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.16 }} className="h-full min-h-0">
+                {nav === "chat" && (active ? <div className="h-full min-h-0"><Chat key={active} roomId={active} /></div> : <div className="p-8 text-sm text-slate-500">{rooms.length ? "Select a room." : "No rooms yet — create one with the + button in the sidebar."}</div>)}
                 {nav === "agents" && <Agents />}
                 {nav === "tasks" && <Tasks />}
                 {nav === "requests" && <Requests />}
