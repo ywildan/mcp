@@ -243,7 +243,7 @@ export function CodeBlock({ code, title, className, maxH }: { code: string; titl
         <CopyButton text={code} />
       </div>
       <pre className={cn("code-scroll overflow-auto p-4 font-mono text-[12.5px] leading-[1.75] text-paper", maxH)}>
-        <code>
+        <code className="text-paper!">
           {code.split("\n").map((l, i) => (
             <div key={i} className="whitespace-pre">{hl(l) || " "}</div>
           ))}
