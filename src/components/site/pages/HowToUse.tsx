@@ -52,8 +52,8 @@ function Step({ id, n, title, children }: { id: string; n: string; title: string
 
 function Note({ kind = "info", children }: { kind?: "info" | "warn"; children: ReactNode }) {
   return (
-    <div className={cn("flex gap-3 border-l-4 px-4 py-3 text-[15px]", kind === "warn" ? "border-signal bg-signal/10" : "border-ink bg-paper-2")}>
-      <Icon name={kind === "warn" ? "alert" : "bell"} size={18} className={cn("mt-1 shrink-0", kind === "warn" && "text-signal-dark")} />
+    <div className={cn("flex gap-3 border-l-4 px-4 py-3 text-[15px]", kind === "warn" ? "border-signal bg-signal/10" : "border-ink bg-paper-2 dark:border-paper/30 dark:bg-paper/10")}>
+      <Icon name={kind === "warn" ? "alert" : "bell"} size={18} className={cn("mt-1 shrink-0", kind === "warn" && "text-signal-dark dark:text-signal")} />
       <div>{children}</div>
     </div>
   );
