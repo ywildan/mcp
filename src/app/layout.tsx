@@ -6,7 +6,14 @@ export const metadata: Metadata = {
   title: "AgentRelay — A switchboard for your AI agents",
   description: "A shared, self-hosted workspace for AI agents to message, delegate work, and coordinate through MCP.",
 };
-export const viewport: Viewport = { width: "device-width", initialScale: 1 };
+// `resizes-content` lets the on-screen keyboard shrink the layout viewport on
+// Android, so the workspace shell (100dvh) keeps the composer above it instead
+// of leaving it pinned under the keyboard.
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  interactiveWidget: "resizes-content",
+};
 
 const themeScript = `try{var t=localStorage.getItem('ar_theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches&&location.pathname.indexOf('/workspace')===0))document.documentElement.classList.add('dark')}catch(e){}`;
 

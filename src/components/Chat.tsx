@@ -108,7 +108,9 @@ export default function Chat({ roomId }: { roomId: string }) {
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1">
       <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-10 flex shrink-0 items-center gap-2 border-b border-slate-200 bg-paper px-4 py-2.5 dark:border-slate-800 dark:bg-slate-950">
+        {/* No `sticky` here: the shell never scrolls, and the nearest scrollport
+            (the overflow-hidden wrapper) would make it a no-op anyway. */}
+        <header className="relative z-10 flex shrink-0 items-center gap-2 border-b border-slate-200 bg-paper px-4 py-2.5 dark:border-slate-800 dark:bg-slate-950">
           <div className="min-w-0 flex-1">
             <h1 className="truncate text-sm font-bold">
               {room.kind === "dm" ? "" : "# "}
@@ -116,12 +118,12 @@ export default function Chat({ roomId }: { roomId: string }) {
             </h1>
             <p className="truncate text-xs text-slate-500">{room.topic || `${room.member_count} members · hop ${room.hop_count}/${room.hop_limit}`}</p>
           </div>
-          <button className={btn} onClick={toggleRoom}>
+          <button className={btn} onClick={toggleRoom} aria-label={room.state === "paused" ? "Resume room" : "Pause room"}>
             {room.state === "paused" ? <Icon name="play" size={14} /> : <Icon name="pause" size={14} />}
-            {room.state === "paused" ? "Resume" : "Pause room"}
+            <span className="hidden sm:inline">{room.state === "paused" ? "Resume" : "Pause room"}</span>
           </button>
-          <button className={btn} onClick={() => setPanel((p) => !p)} aria-pressed={panel}>
-            <Icon name="info" size={14} /> Info
+          <button className={btn} onClick={() => setPanel((p) => !p)} aria-pressed={panel} aria-label="Room info">
+            <Icon name="info" size={14} /> <span className="hidden sm:inline">Info</span>
           </button>
         </header>
 
@@ -136,7 +138,7 @@ export default function Chat({ roomId }: { roomId: string }) {
           </div>
         )}
 
-        <div ref={listRef} onScroll={onScroll} className="relative min-h-0 flex-1 space-y-1 overflow-y-auto px-4 py-3">
+        <div ref={listRef} onScroll={onScroll} className="relative min-h-0 flex-1 space-y-1 overflow-y-auto overscroll-contain px-4 py-3">
           {hasMore && <div className="py-2 text-center text-xs text-slate-500">{loadingOlder ? "Loading…" : "Scroll up for older messages"}</div>}
           {!msgs.length && <div className="py-16 text-center text-sm text-slate-500">No messages yet. Start the conversation.</div>}
           {msgs.map((m, i) => (
@@ -166,7 +168,8 @@ export default function Chat({ roomId }: { roomId: string }) {
         )}
         <Composer roomId={roomId} members={members} agents={agents} replyTo={replyTo} clearReply={() => setReplyTo(null)} />
       </div>
-      {panel && <RoomPanel roomId={roomId} room={room} members={members} reload={loadMembers} />}
+      {panel && <button className="fixed inset-0 z-30 bg-slate-950/50 md:hidden" onClick={() => setPanel(false)} aria-label="Close room info" />}
+      {panel && <RoomPanel roomId={roomId} room={room} members={members} reload={loadMembers} onClose={() => setPanel(false)} />}
       {thread && (
         <Modal title="Thread" onClose={() => setThread(null)}>
           <div className="space-y-2">
@@ -284,7 +287,9 @@ function MessageItem({ m, prev, byId, meHandle, requests, onReply, onThread, isA
             ))}
           </div>
         )}
-        <div className="hidden gap-2 pt-0.5 text-[11px] text-slate-500 group-hover:flex">
+        {/* Touch devices have no hover: keep the actions reachable there, and only
+            reveal them on hover for mouse users. */}
+        <div className="hidden gap-2 pt-0.5 text-[11px] text-slate-500 group-hover:flex [@media(hover:none)]:flex">
           <button className="hover:underline" onClick={onReply}>
             Reply
           </button>
@@ -396,7 +401,7 @@ function Composer({ roomId, members, agents, replyTo, clearReply }: any) {
         </ul>
       )}
       <div className="flex items-end gap-2">
-        <label className={`${btn} h-10 w-10 cursor-pointer !p-0`} title="Attach file" aria-label="Attach file">
+        <label className={`${btn} h-11 w-11 shrink-0 cursor-pointer !p-0`} title="Attach file" aria-label="Attach file">
           <Icon name="paperclip" size={17} />
           <input type="file" className="hidden" onChange={(e) => e.target.files?.[0] && attach(e.target.files[0])} />
         </label>
@@ -406,6 +411,7 @@ function Composer({ roomId, members, agents, replyTo, clearReply }: any) {
           className={`${field} resize-none`}
           placeholder="Message… (@mention agents, Enter to send, Shift+Enter for newline)"
           aria-label="Message composer"
+          enterKeyHint="send"
           value={text}
           onChange={(e) => (setText(e.target.value), setSel(0))}
           onKeyDown={(e) => {
@@ -421,15 +427,15 @@ function Composer({ roomId, members, agents, replyTo, clearReply }: any) {
             }
           }}
         />
-        <button className={`${btnPrimary} h-10`} onClick={send} disabled={busy}>
-          <Icon name="send" size={14} /> Send
+        <button className={`${btnPrimary} h-11 shrink-0`} onClick={send} disabled={busy} aria-label="Send message">
+          <Icon name="send" size={14} /> <span className="hidden sm:inline">Send</span>
         </button>
       </div>
     </div>
   );
 }
 
-function RoomPanel({ roomId, room, members, reload }: any) {
+function RoomPanel({ roomId, room, members, reload, onClose }: any) {
   const { agents, toast, refreshRooms } = useApp();
   const [tasks, setTasks] = useState<any[]>([]);
   const [arts, setArts] = useState<any[]>([]);
@@ -464,7 +470,13 @@ function RoomPanel({ roomId, room, members, reload }: any) {
   };
   const candidates = agents.filter((a: any) => !members.some((m: any) => m.kind === "agent" && m.id === a.id));
   return (
-    <aside className="hidden h-full w-72 shrink-0 space-y-4 overflow-y-auto border-l border-slate-200 p-3 text-sm md:block dark:border-slate-800" aria-label="Room info">
+    <aside className="fixed inset-y-0 right-0 z-40 flex h-full w-[85vw] max-w-80 shrink-0 flex-col space-y-4 overflow-y-auto overscroll-contain border-l border-slate-200 bg-paper p-3 text-sm shadow-2xl md:static md:z-auto md:w-72 md:max-w-none md:bg-transparent md:shadow-none dark:border-slate-800 dark:bg-slate-950 md:dark:bg-transparent" aria-label="Room info">
+      <div className="flex items-center justify-between md:hidden">
+        <h2 className="text-xs font-bold uppercase text-slate-500">Room info</h2>
+        <button className={`${btn} !h-8 !w-8 !p-0`} onClick={onClose} aria-label="Close room info">
+          <Icon name="close" size={14} />
+        </button>
+      </div>
       <section>
         <h3 className="mb-1.5 text-xs font-bold uppercase text-slate-500">Members ({members.length})</h3>
         <ul className="space-y-1.5">

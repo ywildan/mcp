@@ -289,6 +289,34 @@ export function LandingPage() {
   );
 }
 
+/**
+ * Mobile keyboards shrink only the *visual* viewport on iOS: the layout viewport
+ * keeps its 100vh size, which would leave the composer stuck behind the keyboard.
+ * Mirror the usable height into `--app-h` (falling back to 100dvh) so the shell
+ * follows the keyboard. Android already resizes the layout viewport thanks to
+ * `interactiveWidget: "resizes-content"`, so the override only applies when the
+ * two viewports disagree by roughly a keyboard's worth of pixels.
+ */
+function useViewportHeight() {
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const root = document.documentElement;
+    const sync = () => {
+      if (vv.height < window.innerHeight - 80) root.style.setProperty("--app-h", `${Math.round(vv.height)}px`);
+      else root.style.removeProperty("--app-h");
+    };
+    sync();
+    vv.addEventListener("resize", sync);
+    vv.addEventListener("scroll", sync);
+    return () => {
+      vv.removeEventListener("resize", sync);
+      vv.removeEventListener("scroll", sync);
+      root.style.removeProperty("--app-h");
+    };
+  }, []);
+}
+
 function debounced(fn: () => void, ms = 250) {
   let t: ReturnType<typeof setTimeout>;
   return () => {
@@ -299,6 +327,7 @@ function debounced(fn: () => void, ms = 250) {
 
 export default function App({ signInPage = false, workspaceRoute = false }: { signInPage?: boolean; workspaceRoute?: boolean }) {
   const router = useRouter();
+  useViewportHeight();
   const [boot, setBoot] = useState<{ me: any; needs_setup: boolean; workspace?: { id: string; name: string } | null } | null>(null);
   const [agents, setAgents] = useState<any[]>([]);
   const [rooms, setRooms] = useState<any[]>([]);
@@ -440,7 +469,10 @@ export default function App({ signInPage = false, workspaceRoute = false }: { si
 
   return (
     <AppCtx.Provider value={ctx}>
-      <div className="flex h-screen overflow-hidden bg-paper text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+      {/* The shell owns the viewport: 100dvh follows mobile URL bars, and
+          --app-h (set while a keyboard is open on iOS) shrinks it further.
+          Nothing outside it scrolls, so the app header can never drift away. */}
+      <div className="flex h-[var(--app-h,100dvh)] overflow-hidden overscroll-none bg-paper text-slate-900 dark:bg-slate-950 dark:text-slate-100">
         {menu && <button className="fixed inset-0 z-30 cursor-default bg-slate-950/50 md:hidden" onClick={() => setMenu(false)} aria-label="Close navigation" />}
         <aside className={`fixed inset-y-0 left-0 z-40 flex w-[264px] shrink-0 flex-col overflow-hidden border-r border-white/[0.07] bg-ink text-slate-300 shadow-2xl shadow-black/10 transition-transform md:static md:translate-x-0 md:shadow-none ${menu ? "translate-x-0" : "-translate-x-full"}`} aria-label="Sidebar">
           <div className="flex h-[76px] shrink-0 items-center justify-between border-b border-paper/15 px-5">
@@ -495,7 +527,7 @@ export default function App({ signInPage = false, workspaceRoute = false }: { si
         <main className="flex min-w-0 flex-1 flex-col">
           <header className="z-10 flex h-[62px] shrink-0 items-center justify-between border-b border-ink/20 bg-paper-2 px-4 dark:border-paper/15 dark:bg-slate-900 sm:px-6 lg:px-8">
             <div className="flex items-center gap-3">
-              <button className="flex h-9 w-9 items-center justify-center border border-ink text-ink transition hover:bg-ink hover:text-paper md:hidden dark:border-paper dark:text-paper" onClick={() => setMenu(true)} aria-label="Open menu">
+              <button className="flex h-10 w-10 items-center justify-center border border-ink text-ink transition hover:bg-ink hover:text-paper md:hidden dark:border-paper dark:text-paper" onClick={() => setMenu(true)} aria-label="Open menu">
                 <Icon name="menu" size={19} />
               </button>
               <div>
