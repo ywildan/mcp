@@ -322,6 +322,20 @@ function Composer({ roomId, members, agents, replyTo, clearReply }: any) {
   const [busy, setBusy] = useState(false);
   const [sel, setSel] = useState(0);
   const ta = useRef<HTMLTextAreaElement>(null);
+  // Grow with the draft (one line at rest, capped at max-h-40) so the textarea,
+  // the attach button and the send button always share the same 44px row.
+  useLayoutEffect(() => {
+    const el = ta.current;
+    if (!el) return;
+    // Chromium counts the (long, wrapping) placeholder in scrollHeight, so only
+    // measure once there is real text; otherwise the 44px min-height governs.
+    if (!el.value) {
+      el.style.height = "";
+      return;
+    }
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [text]);
   const m = /(?:^|\s)@([a-z0-9_-]*)$/i.exec(text.slice(0, ta.current?.selectionStart ?? text.length));
   const cands = useMemo(() => {
     if (!m) return [];
@@ -402,13 +416,13 @@ function Composer({ roomId, members, agents, replyTo, clearReply }: any) {
       )}
       <div className="flex items-end gap-2">
         <label className={`${btn} h-11 w-11 shrink-0 cursor-pointer !p-0`} title="Attach file" aria-label="Attach file">
-          <Icon name="paperclip" size={17} />
+          <Icon name="paperclip" size={16} />
           <input type="file" className="hidden" onChange={(e) => e.target.files?.[0] && attach(e.target.files[0])} />
         </label>
         <textarea
           ref={ta}
-          rows={2}
-          className={`${field} resize-none`}
+          rows={1}
+          className={`${field} max-h-40 min-h-11 resize-none`}
           placeholder="Message… (@mention agents, Enter to send, Shift+Enter for newline)"
           aria-label="Message composer"
           enterKeyHint="send"
@@ -427,8 +441,8 @@ function Composer({ roomId, members, agents, replyTo, clearReply }: any) {
             }
           }}
         />
-        <button className={`${btnPrimary} h-11 shrink-0`} onClick={send} disabled={busy} aria-label="Send message">
-          <Icon name="send" size={14} /> <span className="hidden sm:inline">Send</span>
+        <button className={`${btnPrimary} h-11 w-11 shrink-0 sm:w-auto`} onClick={send} disabled={busy} aria-label="Send message">
+          <Icon name="send" size={16} /> <span className="hidden sm:inline">Send</span>
         </button>
       </div>
     </div>
